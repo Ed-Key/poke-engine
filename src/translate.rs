@@ -579,12 +579,16 @@ fn serialize_pokemon(pkmn: &PokemonInput) -> String {
         None => String::new(), // empty string = defaults (85 in all)
     };
 
-    // Map "fnt" (fainted) to "None" — poke-engine doesn't have a fainted status,
-    // fainted Pokemon are represented by hp=0
-    let status = if pkmn.status.eq_ignore_ascii_case("fnt") {
-        "None".to_string()
-    } else {
-        capitalize_type(&pkmn.status)
+    // Map Showdown status abbreviations to poke-engine status names
+    let status = match pkmn.status.to_lowercase().as_str() {
+        "brn" => "Burn".to_string(),
+        "slp" => "Sleep".to_string(),
+        "frz" => "Freeze".to_string(),
+        "par" => "Paralyze".to_string(),
+        "psn" => "Poison".to_string(),
+        "tox" => "Toxic".to_string(),
+        "fnt" | "none" | "" => "None".to_string(),
+        _ => capitalize_type(&pkmn.status), // fallback
     };
 
     // Serialize moves (pad to 4 with NONE defaults)
