@@ -579,7 +579,13 @@ fn serialize_pokemon(pkmn: &PokemonInput) -> String {
         None => String::new(), // empty string = defaults (85 in all)
     };
 
-    let status = capitalize_type(&pkmn.status);
+    // Map "fnt" (fainted) to "None" — poke-engine doesn't have a fainted status,
+    // fainted Pokemon are represented by hp=0
+    let status = if pkmn.status.eq_ignore_ascii_case("fnt") {
+        "None".to_string()
+    } else {
+        capitalize_type(&pkmn.status)
+    };
 
     // Serialize moves (pad to 4 with NONE defaults)
     let mut move_strs: Vec<String> = pkmn
