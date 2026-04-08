@@ -2,6 +2,10 @@
 //!
 //! Converts JSON battle state from the Cobblemon Minecraft mod into
 //! poke-engine's pipe-delimited state format, then deserializes into a `State` object.
+//!
+//! Supports two input formats:
+//! 1. **BattleRequest** — the original format with `sideOne`/`sideTwo` objects
+//! 2. **FabricAuxState** — the fabric-aux `/api/battle-state` format with a `sides` array
 
 use crate::state::State;
 use serde::Deserialize;
@@ -85,7 +89,7 @@ pub struct MoveInput {
     pub disabled: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct EvsInput {
     #[serde(default)]
     pub hp: u8,
@@ -224,6 +228,307 @@ fn default_none_terrain() -> String {
 
 fn default_terrain_turns() -> i8 {
     5
+}
+
+// -- Fabric-aux format structs --
+
+/// Top-level battle state from the fabric-aux `/api/battle-state` endpoint.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FabricAuxState {
+    #[serde(default)]
+    pub turn: u32,
+    pub weather: Option<String>,
+    pub terrain: Option<String>,
+    pub sides: Vec<FabricAuxSide>,
+}
+
+/// One side (p1 or p2) from fabric-aux.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FabricAuxSide {
+    pub id: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    pub pokemon: Vec<FabricAuxPokemon>,
+}
+
+/// A single Pokemon from the fabric-aux state.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FabricAuxPokemon {
+    pub species: String,
+    #[serde(default = "default_level")]
+    pub level: i8,
+    pub hp: i16,
+    pub maxhp: i16,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub item: Option<String>,
+    #[serde(default = "default_none_str")]
+    pub ability: String,
+    #[serde(default)]
+    pub base_ability: Option<String>,
+    pub types: Vec<String>,
+    pub stats: FabricAuxStats,
+    #[serde(default)]
+    pub ivs: Option<EvsInput>, // Reuse EvsInput since the shape is identical
+    #[serde(default)]
+    pub evs: Option<EvsInput>,
+    #[serde(default = "default_serious")]
+    pub nature: String,
+    #[serde(default)]
+    pub gender: Option<String>,
+    #[serde(default)]
+    pub boosts: Option<FabricAuxBoosts>,
+    pub moves: Vec<FabricAuxMove>,
+    #[serde(default)]
+    pub fainted: bool,
+    #[serde(default)]
+    pub is_active: bool,
+    #[serde(default = "default_weight_hectograms")]
+    pub weight: f32,
+}
+
+/// Stat block from fabric-aux (computed stats, not base stats).
+#[derive(Debug, Deserialize)]
+pub struct FabricAuxStats {
+    pub atk: i16,
+    pub def: i16,
+    pub spa: i16,
+    pub spd: i16,
+    pub spe: i16,
+}
+
+/// Boosts from fabric-aux (per-pokemon).
+#[derive(Debug, Deserialize)]
+pub struct FabricAuxBoosts {
+    #[serde(default)]
+    pub atk: i8,
+    #[serde(default)]
+    pub def: i8,
+    #[serde(default)]
+    pub spa: i8,
+    #[serde(default)]
+    pub spd: i8,
+    #[serde(default)]
+    pub spe: i8,
+    #[serde(default)]
+    pub accuracy: i8,
+    #[serde(default)]
+    pub evasion: i8,
+}
+
+/// A move from fabric-aux state.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FabricAuxMove {
+    pub id: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub pp: Option<i8>,
+    #[serde(default)]
+    pub maxpp: Option<i8>,
+    #[serde(default)]
+    pub disabled: Option<bool>,
+    #[serde(default)]
+    pub base_power: Option<i16>,
+}
+
+fn default_weight_hectograms() -> f32 {
+    255.0 // 25.5 kg in hectograms
+}
+
+// -- Fabric-aux conversion --
+
+/// Convert a `FabricAuxPokemon` into a `PokemonInput` so we can reuse existing
+/// serialization logic.
+fn fabric_aux_pokemon_to_input(pkmn: &FabricAuxPokemon) -> PokemonInput {
+    // fabric-aux weight is in hectograms (e.g. 520 = 52.0 kg)
+    let weight_kg = pkmn.weight / 10.0;
+
+    let hp = if pkmn.fainted { 0 } else { pkmn.hp };
+
+    let status = match &pkmn.status {
+        Some(s) if !s.is_empty() => s.clone(),
+        _ => "None".to_string(),
+    };
+
+    let item = match &pkmn.item {
+        Some(i) if !i.is_empty() => i.clone(),
+        _ => "NONE".to_string(),
+    };
+
+    let moves: Vec<MoveInput> = pkmn
+        .moves
+        .iter()
+        .map(|m| MoveInput {
+            id: m.id.clone(),
+            pp: m.pp,
+            disabled: m.disabled.unwrap_or(false),
+        })
+        .collect();
+
+    PokemonInput {
+        species: pkmn.species.clone(),
+        level: pkmn.level,
+        types: pkmn.types.clone(),
+        hp,
+        maxhp: pkmn.maxhp,
+        ability: pkmn.ability.clone(),
+        item,
+        nature: pkmn.nature.clone(),
+        evs: pkmn.evs.clone(),
+        attack: pkmn.stats.atk,
+        defense: pkmn.stats.def,
+        special_attack: pkmn.stats.spa,
+        special_defense: pkmn.stats.spd,
+        speed: pkmn.stats.spe,
+        status,
+        rest_turns: 0,
+        sleep_turns: 0,
+        weight_kg,
+        moves,
+        terastallized: false,
+        tera_type: "Normal".to_string(),
+    }
+}
+
+/// Convert a `FabricAuxSide` into a `SideInput`, determining the active index
+/// from the `isActive` flag on each Pokemon.
+fn fabric_aux_side_to_input(side: &FabricAuxSide) -> SideInput {
+    let active_index = side
+        .pokemon
+        .iter()
+        .position(|p| p.is_active)
+        .unwrap_or(0);
+
+    let pokemon: Vec<PokemonInput> = side
+        .pokemon
+        .iter()
+        .map(|p| fabric_aux_pokemon_to_input(p))
+        .collect();
+
+    // Use the ACTIVE Pokemon's boosts for the side boosts
+    let boosts = side
+        .pokemon
+        .get(active_index)
+        .and_then(|p| p.boosts.as_ref())
+        .map(|b| BoostsInput {
+            attack: b.atk,
+            defense: b.def,
+            special_attack: b.spa,
+            special_defense: b.spd,
+            speed: b.spe,
+            accuracy: b.accuracy,
+            evasion: b.evasion,
+        });
+
+    SideInput {
+        pokemon,
+        active_index,
+        side_conditions: None,
+        volatile_statuses: None,
+        boosts,
+        force_trapped: false,
+    }
+}
+
+/// Convert a `FabricAuxState` into a poke-engine `State`.
+///
+/// sides[0] (p1) becomes side_one, sides[1] (p2) becomes side_two.
+pub fn from_fabric_aux(state: &FabricAuxState) -> State {
+    let side_one = if !state.sides.is_empty() {
+        fabric_aux_side_to_input(&state.sides[0])
+    } else {
+        SideInput {
+            pokemon: vec![],
+            active_index: 0,
+            side_conditions: None,
+            volatile_statuses: None,
+            boosts: None,
+            force_trapped: false,
+        }
+    };
+
+    let side_two = if state.sides.len() > 1 {
+        fabric_aux_side_to_input(&state.sides[1])
+    } else {
+        SideInput {
+            pokemon: vec![],
+            active_index: 0,
+            side_conditions: None,
+            volatile_statuses: None,
+            boosts: None,
+            force_trapped: false,
+        }
+    };
+
+    // Convert weather string to WeatherInput
+    let weather = state.weather.as_ref().and_then(|w| {
+        if w.is_empty() || w == "none" {
+            None
+        } else {
+            Some(WeatherInput {
+                weather_type: w.clone(),
+                turns_remaining: default_weather_turns(),
+            })
+        }
+    });
+
+    // Convert terrain string to TerrainInput
+    let terrain = state.terrain.as_ref().and_then(|t| {
+        if t.is_empty() || t == "none" {
+            None
+        } else {
+            Some(TerrainInput {
+                terrain_type: t.clone(),
+                turns_remaining: default_terrain_turns(),
+            })
+        }
+    });
+
+    let request = BattleRequest {
+        side_one,
+        side_two,
+        weather,
+        terrain,
+        trick_room: false,
+        trick_room_turns: None,
+    };
+
+    to_poke_state(&request)
+}
+
+/// Parse fabric-aux JSON directly into a `State`.
+pub fn fabric_aux_json_to_poke_state(json: &str) -> Result<State, serde_json::Error> {
+    let state: FabricAuxState = serde_json::from_str(json)?;
+    Ok(from_fabric_aux(&state))
+}
+
+/// Auto-detect the JSON format and parse into a `State`.
+///
+/// Tries fabric-aux format first (checks for `"sides"` key), then falls back
+/// to the original `BattleRequest` format.
+pub fn auto_detect_and_parse(json: &str) -> Result<State, String> {
+    // Quick heuristic: if the JSON contains "sides", it's fabric-aux format
+    // Use serde_json::Value for reliable detection
+    let value: serde_json::Value =
+        serde_json::from_str(json).map_err(|e| format!("Invalid JSON: {}", e))?;
+
+    if value.get("sides").is_some() {
+        // Fabric-aux format
+        fabric_aux_json_to_poke_state(json)
+            .map_err(|e| format!("Failed to parse fabric-aux state: {}", e))
+    } else if value.get("sideOne").is_some() || value.get("side_one").is_some() {
+        // Original BattleRequest format
+        json_to_poke_state(json)
+            .map_err(|e| format!("Failed to parse BattleRequest: {}", e))
+    } else {
+        Err("Unrecognized battle state format: expected 'sides' (fabric-aux) or 'sideOne' (BattleRequest)".to_string())
+    }
 }
 
 // -- Serialization helpers --
@@ -775,6 +1080,270 @@ mod tests {
         let active = state.side_one.get_active_immutable();
         assert_eq!(active.hp, 200);
         // Verify the state roundtrips successfully (implies status parsed correctly)
+        let serialized = state.serialize();
+        let state2 = State::deserialize(&serialized);
+        assert_eq!(state.serialize(), state2.serialize());
+    }
+
+    // -- Fabric-aux format tests --
+
+    fn fabric_aux_sample_json() -> &'static str {
+        r#"{
+            "turn": 1,
+            "weather": null,
+            "terrain": null,
+            "sides": [
+                {
+                    "id": "p1",
+                    "name": "player-uuid",
+                    "pokemon": [
+                        {
+                            "species": "Blaziken",
+                            "level": 26,
+                            "hp": 81,
+                            "maxhp": 85,
+                            "status": null,
+                            "item": null,
+                            "ability": "speedboost",
+                            "baseAbility": "speedboost",
+                            "types": ["Fire", "Fighting"],
+                            "stats": {"atk": 91, "def": 48, "spa": 63, "spd": 48, "spe": 78},
+                            "ivs": {"hp": 31, "atk": 31, "def": 26, "spa": 31, "spd": 27, "spe": 31},
+                            "evs": {"hp": 4, "atk": 252, "def": 2, "spa": 0, "spd": 0, "spe": 252},
+                            "nature": "Jolly",
+                            "gender": "M",
+                            "boosts": {"atk": 0, "def": -1, "spa": 0, "spd": -1, "spe": 0, "accuracy": 0, "evasion": 0},
+                            "moves": [
+                                {"name": "Swords Dance", "id": "swordsdance", "pp": 20, "maxpp": 20, "basePower": 0},
+                                {"name": "Close Combat", "id": "closecombat", "pp": 3, "maxpp": 5, "basePower": 0},
+                                {"name": "Knock Off", "id": "knockoff", "pp": 20, "maxpp": 20, "basePower": 0},
+                                {"name": "Blaze Kick", "id": "blazekick", "pp": 9, "maxpp": 10, "basePower": 0}
+                            ],
+                            "fainted": false,
+                            "isActive": true,
+                            "weight": 520
+                        },
+                        {
+                            "species": "Pangoro",
+                            "level": 25,
+                            "hp": 106,
+                            "maxhp": 106,
+                            "status": null,
+                            "item": null,
+                            "ability": "ironfist",
+                            "baseAbility": "ironfist",
+                            "types": ["Fighting", "Dark"],
+                            "stats": {"atk": 99, "def": 50, "spa": 42, "spd": 44, "spe": 41},
+                            "ivs": {"hp": 31, "atk": 31, "def": 27, "spa": 31, "spd": 14, "spe": 31},
+                            "evs": {"hp": 252, "atk": 252, "def": 0, "spa": 0, "spd": 0, "spe": 0},
+                            "nature": "Adamant",
+                            "gender": "F",
+                            "boosts": {"atk": 0, "def": 0, "spa": 0, "spd": 0, "spe": 0, "accuracy": 0, "evasion": 0},
+                            "moves": [
+                                {"name": "Crunch", "id": "crunch", "pp": 15, "maxpp": 15, "basePower": 0},
+                                {"name": "Drain Punch", "id": "drainpunch", "pp": 10, "maxpp": 10, "basePower": 0},
+                                {"name": "Ice Punch", "id": "icepunch", "pp": 15, "maxpp": 15, "basePower": 0},
+                                {"name": "Bullet Punch", "id": "bulletpunch", "pp": 30, "maxpp": 30, "basePower": 0}
+                            ],
+                            "fainted": false,
+                            "isActive": false,
+                            "weight": 1360
+                        }
+                    ]
+                },
+                {
+                    "id": "p2",
+                    "name": "opponent-uuid",
+                    "pokemon": [
+                        {
+                            "species": "Meowth",
+                            "level": 13,
+                            "hp": 0,
+                            "maxhp": 36,
+                            "status": null,
+                            "item": null,
+                            "ability": "technician",
+                            "baseAbility": "technician",
+                            "types": ["Normal"],
+                            "stats": {"atk": 18, "def": 16, "spa": 18, "spd": 18, "spe": 27},
+                            "ivs": {"hp": 22, "atk": 15, "def": 20, "spa": 26, "spd": 18, "spe": 14},
+                            "evs": {"hp": 0, "atk": 0, "def": 0, "spa": 0, "spd": 0, "spe": 0},
+                            "nature": "Sassy",
+                            "gender": "M",
+                            "boosts": {"atk": 0, "def": 0, "spa": 0, "spd": 0, "spe": 0, "accuracy": 0, "evasion": 0},
+                            "moves": [
+                                {"name": "Pay Day", "id": "payday", "pp": 20, "maxpp": 20, "basePower": 0},
+                                {"name": "Scratch", "id": "scratch", "pp": 35, "maxpp": 35, "basePower": 0},
+                                {"name": "Feint", "id": "feint", "pp": 9, "maxpp": 10, "basePower": 0},
+                                {"name": "Fake Out", "id": "fakeout", "pp": 10, "maxpp": 10, "basePower": 0}
+                            ],
+                            "fainted": true,
+                            "isActive": false,
+                            "weight": 42
+                        }
+                    ]
+                }
+            ]
+        }"#
+    }
+
+    #[test]
+    fn test_fabric_aux_basic_parse() {
+        let state =
+            fabric_aux_json_to_poke_state(fabric_aux_sample_json()).expect("Failed to parse");
+
+        // Side one active = Blaziken
+        let active_one = state.side_one.get_active_immutable();
+        assert_eq!(active_one.hp, 81);
+        assert_eq!(active_one.maxhp, 85);
+        assert_eq!(active_one.level, 26);
+        assert_eq!(active_one.attack, 91);
+        assert_eq!(active_one.defense, 48);
+        assert_eq!(active_one.special_attack, 63);
+        assert_eq!(active_one.special_defense, 48);
+        assert_eq!(active_one.speed, 78);
+    }
+
+    #[test]
+    fn test_fabric_aux_active_pokemon_detection() {
+        let state =
+            fabric_aux_json_to_poke_state(fabric_aux_sample_json()).expect("Failed to parse");
+
+        // Active index should be 0 (Blaziken has isActive: true)
+        let active = state.side_one.get_active_immutable();
+        assert_eq!(active.hp, 81); // Blaziken's HP
+        assert_eq!(active.maxhp, 85);
+    }
+
+    #[test]
+    fn test_fabric_aux_boosts_on_side() {
+        let state =
+            fabric_aux_json_to_poke_state(fabric_aux_sample_json()).expect("Failed to parse");
+
+        // Blaziken has def: -1 and spd: -1 boosts
+        assert_eq!(state.side_one.defense_boost, -1);
+        assert_eq!(state.side_one.special_defense_boost, -1);
+        assert_eq!(state.side_one.attack_boost, 0);
+        assert_eq!(state.side_one.speed_boost, 0);
+    }
+
+    #[test]
+    fn test_fabric_aux_fainted_pokemon() {
+        let state =
+            fabric_aux_json_to_poke_state(fabric_aux_sample_json()).expect("Failed to parse");
+
+        // Meowth on side two is fainted — HP should be 0
+        let meowth = &state.side_two.pokemon.pkmn[0];
+        assert_eq!(meowth.hp, 0);
+        assert_eq!(meowth.maxhp, 36);
+    }
+
+    #[test]
+    fn test_fabric_aux_weight_conversion() {
+        let state =
+            fabric_aux_json_to_poke_state(fabric_aux_sample_json()).expect("Failed to parse");
+
+        // Blaziken weight: 520 hectograms = 52.0 kg
+        let active = state.side_one.get_active_immutable();
+        assert!((active.weight_kg - 52.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn test_fabric_aux_team_padding() {
+        let state =
+            fabric_aux_json_to_poke_state(fabric_aux_sample_json()).expect("Failed to parse");
+
+        // Side one has 2 pokemon, slots 2-5 should be blank (0 HP)
+        assert_eq!(state.side_one.pokemon.pkmn[2].hp, 0);
+        assert_eq!(state.side_one.pokemon.pkmn[3].hp, 0);
+
+        // Side two has 1 pokemon, slots 1-5 should be blank
+        assert_eq!(state.side_two.pokemon.pkmn[1].hp, 0);
+    }
+
+    #[test]
+    fn test_fabric_aux_moves_parsed() {
+        let state =
+            fabric_aux_json_to_poke_state(fabric_aux_sample_json()).expect("Failed to parse");
+
+        // Blaziken should have swordsdance, closecombat, knockoff, blazekick
+        let active = state.side_one.get_active_immutable();
+        // Verify that moves were parsed (check that pp values are preserved)
+        // Close Combat is move index 1 with pp: 3
+        use crate::state::PokemonMoveIndex;
+        assert_eq!(active.moves[&PokemonMoveIndex::M1].pp, 3);
+    }
+
+    #[test]
+    fn test_fabric_aux_roundtrip() {
+        let state =
+            fabric_aux_json_to_poke_state(fabric_aux_sample_json()).expect("Failed to parse");
+        let serialized = state.serialize();
+        let state2 = State::deserialize(&serialized);
+        assert_eq!(state.serialize(), state2.serialize());
+    }
+
+    #[test]
+    fn test_auto_detect_fabric_aux() {
+        let state =
+            auto_detect_and_parse(fabric_aux_sample_json()).expect("Failed to auto-detect");
+        let active = state.side_one.get_active_immutable();
+        assert_eq!(active.hp, 81);
+    }
+
+    #[test]
+    fn test_auto_detect_battle_request() {
+        let state = auto_detect_and_parse(sample_json()).expect("Failed to auto-detect");
+        let active = state.side_one.get_active_immutable();
+        assert_eq!(active.hp, 302);
+    }
+
+    #[test]
+    fn test_auto_detect_invalid_json() {
+        let result = auto_detect_and_parse("not json");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_auto_detect_unrecognized_format() {
+        let result = auto_detect_and_parse(r#"{"foo": "bar"}"#);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Unrecognized"));
+    }
+
+    #[test]
+    fn test_fabric_aux_real_state_file() {
+        // Test with the actual /tmp/real_state.json content if available
+        let json = r#"{"turn":1,"weather":null,"terrain":null,"sides":[{"id":"p1","name":"adfb38d8-117b-4683-94b0-60d3cf7a31a8","pokemon":[{"species":"Blaziken","level":26,"hp":81,"maxhp":85,"status":null,"item":null,"ability":"speedboost","baseAbility":"speedboost","types":["Fire","Fighting"],"stats":{"atk":91,"def":48,"spa":63,"spd":48,"spe":78},"ivs":{"hp":31,"atk":31,"def":26,"spa":31,"spd":27,"spe":31},"evs":{"hp":4,"atk":252,"def":2,"spa":0,"spd":0,"spe":252},"nature":"Jolly","gender":"M","boosts":{"atk":0,"def":-1,"spa":0,"spd":-1,"spe":0,"accuracy":0,"evasion":0},"moves":[{"name":"Swords Dance","id":"swordsdance","pp":20,"maxpp":20,"basePower":0},{"name":"Close Combat","id":"closecombat","pp":3,"maxpp":5,"basePower":0},{"name":"Knock Off","id":"knockoff","pp":20,"maxpp":20,"basePower":0},{"name":"Blaze Kick","id":"blazekick","pp":9,"maxpp":10,"basePower":0}],"fainted":false,"isActive":true,"weight":520},{"species":"Pangoro","level":25,"hp":106,"maxhp":106,"status":null,"item":null,"ability":"ironfist","baseAbility":"ironfist","types":["Fighting","Dark"],"stats":{"atk":99,"def":50,"spa":42,"spd":44,"spe":41},"ivs":{"hp":31,"atk":31,"def":27,"spa":31,"spd":14,"spe":31},"evs":{"hp":252,"atk":252,"def":0,"spa":0,"spd":0,"spe":0},"nature":"Adamant","gender":"F","boosts":{"atk":0,"def":0,"spa":0,"spd":0,"spe":0,"accuracy":0,"evasion":0},"moves":[{"name":"Crunch","id":"crunch","pp":15,"maxpp":15,"basePower":0},{"name":"Drain Punch","id":"drainpunch","pp":10,"maxpp":10,"basePower":0},{"name":"Ice Punch","id":"icepunch","pp":15,"maxpp":15,"basePower":0},{"name":"Bullet Punch","id":"bulletpunch","pp":30,"maxpp":30,"basePower":0}],"fainted":false,"isActive":false,"weight":1360},{"species":"Lucario","level":25,"hp":78,"maxhp":78,"status":null,"item":null,"ability":"innerfocus","baseAbility":"innerfocus","types":["Fighting","Steel"],"stats":{"atk":60,"def":40,"spa":86,"spd":42,"spe":80},"ivs":{"hp":31,"atk":31,"def":0,"spa":31,"spd":9,"spe":31},"evs":{"hp":4,"atk":0,"def":0,"spa":252,"spd":0,"spe":252},"nature":"Timid","gender":"M","boosts":{"atk":0,"def":0,"spa":0,"spd":0,"spe":0,"accuracy":0,"evasion":0},"moves":[{"name":"Calm Mind","id":"calmmind","pp":20,"maxpp":20,"basePower":0},{"name":"Aura Sphere","id":"aurasphere","pp":20,"maxpp":20,"basePower":0},{"name":"Flash Cannon","id":"flashcannon","pp":10,"maxpp":10,"basePower":0},{"name":"Dark Pulse","id":"darkpulse","pp":15,"maxpp":15,"basePower":0}],"fainted":false,"isActive":false,"weight":540},{"species":"Hawlucha","level":25,"hp":82,"maxhp":82,"status":null,"item":null,"ability":"unburden","baseAbility":"unburden","types":["Fighting","Flying"],"stats":{"atk":74,"def":48,"spa":44,"spd":44,"spe":95},"ivs":{"hp":31,"atk":31,"def":24,"spa":31,"spd":31,"spe":31},"evs":{"hp":4,"atk":252,"def":0,"spa":0,"spd":0,"spe":252},"nature":"Jolly","gender":"M","boosts":{"atk":0,"def":0,"spa":0,"spd":0,"spe":0,"accuracy":0,"evasion":0},"moves":[{"name":"Swords Dance","id":"swordsdance","pp":20,"maxpp":20,"basePower":0},{"name":"Acrobatics","id":"acrobatics","pp":15,"maxpp":15,"basePower":0},{"name":"Close Combat","id":"closecombat","pp":5,"maxpp":5,"basePower":0},{"name":"Roost","id":"roost","pp":5,"maxpp":5,"basePower":0}],"fainted":false,"isActive":false,"weight":215},{"species":"Breloom","level":25,"hp":73,"maxhp":73,"status":null,"item":null,"ability":"poisonheal","baseAbility":"poisonheal","types":["Grass","Fighting"],"stats":{"atk":102,"def":48,"spa":37,"spd":41,"spe":63},"ivs":{"hp":31,"atk":31,"def":14,"spa":31,"spd":26,"spe":31},"evs":{"hp":4,"atk":252,"def":2,"spa":0,"spd":0,"spe":252},"nature":"Adamant","gender":"F","boosts":{"atk":0,"def":0,"spa":0,"spd":0,"spe":0,"accuracy":0,"evasion":0},"moves":[{"name":"Spore","id":"spore","pp":15,"maxpp":15,"basePower":0},{"name":"Mach Punch","id":"machpunch","pp":30,"maxpp":30,"basePower":0},{"name":"Seed Bomb","id":"seedbomb","pp":15,"maxpp":15,"basePower":0},{"name":"Leech Seed","id":"leechseed","pp":10,"maxpp":10,"basePower":0}],"fainted":false,"isActive":false,"weight":392},{"species":"Great Tusk","level":25,"hp":100,"maxhp":100,"status":null,"item":null,"ability":"protosynthesis","baseAbility":"protosynthesis","types":["Ground","Fighting"],"stats":{"atk":94,"def":77,"spa":35,"spd":39,"spe":79},"ivs":{"hp":31,"atk":31,"def":27,"spa":31,"spd":31,"spe":31},"evs":{"hp":4,"atk":252,"def":0,"spa":0,"spd":0,"spe":252},"nature":"Jolly","gender":null,"boosts":{"atk":0,"def":0,"spa":0,"spd":0,"spe":0,"accuracy":0,"evasion":0},"moves":[{"name":"Earthquake","id":"earthquake","pp":10,"maxpp":10,"basePower":0},{"name":"Close Combat","id":"closecombat","pp":5,"maxpp":5,"basePower":0},{"name":"Knock Off","id":"knockoff","pp":20,"maxpp":20,"basePower":0},{"name":"Rapid Spin","id":"rapidspin","pp":40,"maxpp":40,"basePower":0}],"fainted":false,"isActive":false,"weight":3200}]},{"id":"p2","name":"5723adc0-fdda-4730-9634-5bad49796435","pokemon":[{"species":"Meowth","level":13,"hp":0,"maxhp":36,"status":null,"item":null,"ability":"technician","baseAbility":"technician","types":["Normal"],"stats":{"atk":18,"def":16,"spa":18,"spd":18,"spe":27},"ivs":{"hp":22,"atk":15,"def":20,"spa":26,"spd":18,"spe":14},"evs":{"hp":0,"atk":0,"def":0,"spa":0,"spd":0,"spe":0},"nature":"Sassy","gender":"M","boosts":{"atk":0,"def":0,"spa":0,"spd":0,"spe":0,"accuracy":0,"evasion":0},"moves":[{"name":"Pay Day","id":"payday","pp":20,"maxpp":20,"basePower":0},{"name":"Scratch","id":"scratch","pp":35,"maxpp":35,"basePower":0},{"name":"Feint","id":"feint","pp":9,"maxpp":10,"basePower":0},{"name":"Fake Out","id":"fakeout","pp":10,"maxpp":10,"basePower":0}],"fainted":true,"isActive":false,"weight":42}]}]}"#;
+
+        let state = auto_detect_and_parse(json).expect("Failed to parse real state");
+
+        // Verify p1 side (6 pokemon)
+        let active = state.side_one.get_active_immutable();
+        assert_eq!(active.hp, 81);
+        assert_eq!(active.level, 26);
+
+        // Verify Pangoro is at index 1
+        assert_eq!(state.side_one.pokemon.pkmn[1].hp, 106);
+        assert_eq!(state.side_one.pokemon.pkmn[1].maxhp, 106);
+
+        // Verify all 6 pokemon on side one are populated
+        assert_eq!(state.side_one.pokemon.pkmn[0].hp, 81);  // Blaziken
+        assert_eq!(state.side_one.pokemon.pkmn[1].hp, 106); // Pangoro
+        assert_eq!(state.side_one.pokemon.pkmn[2].hp, 78);  // Lucario
+        assert_eq!(state.side_one.pokemon.pkmn[3].hp, 82);  // Hawlucha
+        assert_eq!(state.side_one.pokemon.pkmn[4].hp, 73);  // Breloom
+        assert_eq!(state.side_one.pokemon.pkmn[5].hp, 100); // Great Tusk
+
+        // Verify p2 side (fainted Meowth)
+        assert_eq!(state.side_two.pokemon.pkmn[0].hp, 0);
+        assert_eq!(state.side_two.pokemon.pkmn[0].maxhp, 36);
+
+        // Verify boosts from active Blaziken are on side_one
+        assert_eq!(state.side_one.defense_boost, -1);
+        assert_eq!(state.side_one.special_defense_boost, -1);
+
+        // Roundtrip test
         let serialized = state.serialize();
         let state2 = State::deserialize(&serialized);
         assert_eq!(state.serialize(), state2.serialize());

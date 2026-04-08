@@ -5,8 +5,7 @@ use axum::{
     Router,
 };
 use poke_engine::mcts::perform_mcts;
-use poke_engine::translate::BattleRequest;
-use poke_engine::translate::to_poke_state;
+use poke_engine::translate::auto_detect_and_parse;
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 
@@ -18,10 +17,11 @@ const DEFAULT_TIME_LIMIT_MS: u64 = 5000;
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AnalyzeRequest {
-    #[serde(flatten)]
-    battle: BattleRequest,
     #[serde(default)]
     time_limit: Option<u64>,
+    /// Captures the entire JSON body so auto_detect_and_parse can inspect it.
+    #[serde(flatten)]
+    raw: serde_json::Value,
 }
 
 #[derive(Serialize)]
@@ -71,11 +71,14 @@ async fn analyze_handler(
 ) -> Result<Json<AnalyzeResponse>, (StatusCode, Json<ErrorResponse>)> {
     let time_limit_ms = request.time_limit.unwrap_or(DEFAULT_TIME_LIMIT_MS);
 
+    // Re-serialize the raw value so auto_detect_and_parse can inspect it
+    let raw_json = serde_json::to_string(&request.raw).unwrap_or_default();
+
     // Translate to poke-engine State — catch panics from deserialization
-    let battle = request.battle;
     let result = tokio::task::spawn_blocking(move || {
-        // Translate JSON -> State
-        let mut state = to_poke_state(&battle);
+        // Translate JSON -> State (auto-detects format)
+        let mut state = auto_detect_and_parse(&raw_json)
+            .map_err(|e| format!("State parse error: {}", e))?;
 
         // Get legal options (root includes tera/mega)
         let (s1_options, s2_options) = state.root_get_all_options();
