@@ -6,7 +6,7 @@ use axum::{
 };
 use poke_engine::mcts::perform_mcts;
 use poke_engine::translate::auto_detect_and_parse;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::time::{Duration, Instant};
 
 const DEFAULT_PORT: u16 = 7267;
@@ -14,15 +14,6 @@ const DEFAULT_TIME_LIMIT_MS: u64 = 5000;
 
 // -- Request / Response types --
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct AnalyzeRequest {
-    #[serde(default)]
-    time_limit: Option<u64>,
-    /// Captures the entire JSON body so auto_detect_and_parse can inspect it.
-    #[serde(flatten)]
-    raw: serde_json::Value,
-}
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -67,12 +58,15 @@ async fn status_handler() -> Json<StatusResponse> {
 }
 
 async fn analyze_handler(
-    Json(request): Json<AnalyzeRequest>,
+    body: String,
 ) -> Result<Json<AnalyzeResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let time_limit_ms = request.time_limit.unwrap_or(DEFAULT_TIME_LIMIT_MS);
+    // Extract timeLimit if present in the JSON
+    let time_limit_ms = serde_json::from_str::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|v| v.get("timeLimit")?.as_u64())
+        .unwrap_or(DEFAULT_TIME_LIMIT_MS);
 
-    // Re-serialize the raw value so auto_detect_and_parse can inspect it
-    let raw_json = serde_json::to_string(&request.raw).unwrap_or_default();
+    let raw_json = body;
 
     // Translate to poke-engine State — catch panics from deserialization
     let result = tokio::task::spawn_blocking(move || {
