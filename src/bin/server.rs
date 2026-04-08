@@ -23,8 +23,15 @@ struct AnalyzeResponse {
     simulations: u32,
     depth: u32,
     time_ms: u64,
-    reasoning: Vec<String>,
+    reasoning: Vec<ReasoningStep>,
     alternatives: Vec<Alternative>,
+}
+
+#[derive(Serialize)]
+struct ReasoningStep {
+    turn: usize,
+    you: String,
+    them: String,
 }
 
 #[derive(Serialize)]
@@ -131,13 +138,25 @@ async fn analyze_handler(
             })
             .collect();
 
+        let reasoning: Vec<ReasoningStep> = mcts_result
+            .principal_variation
+            .iter()
+            .enumerate()
+            .map(|(i, step)| ReasoningStep {
+                turn: i + 1,
+                you: step.s1_move.clone(),
+                them: step.s2_move.clone(),
+            })
+            .collect();
+        let pv_depth = reasoning.len() as u32;
+
         Ok(AnalyzeResponse {
             best_move: best.0.to_uppercase(),
             confidence: best.1,
             simulations: mcts_result.iteration_count,
-            depth: 4, // MCTS doesn't track explicit depth; placeholder
+            depth: pv_depth,
             time_ms: elapsed_ms,
-            reasoning: vec![],
+            reasoning,
             alternatives,
         })
     })

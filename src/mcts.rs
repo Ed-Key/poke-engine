@@ -225,10 +225,16 @@ impl MctsSideResult {
     }
 }
 
+pub struct PrincipalVariationStep {
+    pub s1_move: String,
+    pub s2_move: String,
+}
+
 pub struct MctsResult {
     pub s1: Vec<MctsSideResult>,
     pub s2: Vec<MctsSideResult>,
     pub iteration_count: u32,
+    pub principal_variation: Vec<PrincipalVariationStep>,
 }
 
 fn do_mcts(root_node: &mut Node, state: &mut State, root_eval: &f32) {
@@ -236,6 +242,76 @@ fn do_mcts(root_node: &mut Node, state: &mut State, root_eval: &f32) {
     new_node = unsafe { (*new_node).expand(state, s1_move, s2_move) };
     let rollout_result = unsafe { (*new_node).rollout(state, root_eval) };
     unsafe { (*new_node).backpropagate(rollout_result, state) }
+}
+
+const PV_MAX_DEPTH: usize = 4;
+
+/// Walk the MCTS tree from `node` following the most-visited moves at each level.
+/// Collects up to `PV_MAX_DEPTH` steps of (s1_move, s2_move) as human-readable strings.
+/// Applies and then reverses instructions so `state` is left unchanged.
+fn extract_principal_variation(node: &Node, state: &mut State) -> Vec<PrincipalVariationStep> {
+    let mut pv = Vec::with_capacity(PV_MAX_DEPTH);
+    let mut applied: Vec<&Vec<crate::instruction::Instruction>> = Vec::new();
+
+    let mut current = node;
+    for _ in 0..PV_MAX_DEPTH {
+        let s1_options = match current.s1_options.as_ref() {
+            Some(opts) => opts,
+            None => break,
+        };
+        let s2_options = match current.s2_options.as_ref() {
+            Some(opts) => opts,
+            None => break,
+        };
+
+        // Find the most-visited s1 and s2 moves
+        let (s1_idx, s1_best) = s1_options
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.visits > 0)
+            .max_by_key(|(_, m)| m.visits)
+            .unwrap_or((0, &s1_options[0]));
+
+        let (s2_idx, s2_best) = s2_options
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.visits > 0)
+            .max_by_key(|(_, m)| m.visits)
+            .unwrap_or((0, &s2_options[0]));
+
+        // Resolve move names using current state
+        let s1_name = s1_best.move_choice.to_string(&state.side_one).to_uppercase();
+        let s2_name = s2_best.move_choice.to_string(&state.side_two).to_uppercase();
+
+        pv.push(PrincipalVariationStep {
+            s1_move: s1_name,
+            s2_move: s2_name,
+        });
+
+        // Descend into the child for this (s1_idx, s2_idx) pair
+        let children = match current.children.get(&(s1_idx, s2_idx)) {
+            Some(c) => c,
+            None => break,
+        };
+
+        // Pick the child node with the most visits (handles damage branching)
+        let best_child = match children.iter().max_by_key(|c| c.times_visited) {
+            Some(c) => c,
+            None => break,
+        };
+
+        // Apply instructions to advance state to this child's depth
+        state.apply_instructions(&best_child.instructions.instruction_list);
+        applied.push(&best_child.instructions.instruction_list);
+        current = best_child;
+    }
+
+    // Reverse all applied instructions to restore the original state
+    for instructions in applied.iter().rev() {
+        state.reverse_instructions(instructions);
+    }
+
+    pv
 }
 
 pub fn perform_mcts(
@@ -274,6 +350,8 @@ pub fn perform_mcts(
         }
     }
 
+    let principal_variation = extract_principal_variation(&root_node, state);
+
     let result = MctsResult {
         s1: root_node
             .s1_options
@@ -298,6 +376,7 @@ pub fn perform_mcts(
             })
             .collect(),
         iteration_count: root_node.times_visited,
+        principal_variation,
     };
 
     result
