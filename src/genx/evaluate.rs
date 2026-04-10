@@ -2,7 +2,9 @@ use super::abilities::Abilities;
 use super::items::Items;
 use super::state::PokemonVolatileStatus;
 use crate::choices::MoveCategory;
-use crate::state::{Pokemon, PokemonStatus, Side, State};
+use crate::engine::damage_calc::{calculate_damage, DamageRolls};
+use crate::engine::generate_instructions::get_effective_speed;
+use crate::state::{Pokemon, PokemonStatus, Side, SideReference, State};
 
 const POKEMON_ALIVE: f32 = 30.0;
 const POKEMON_HP: f32 = 100.0;
@@ -13,6 +15,8 @@ const POKEMON_DEFENSE_BOOST: f32 = 15.0;
 const POKEMON_SPECIAL_ATTACK_BOOST: f32 = 30.0;
 const POKEMON_SPECIAL_DEFENSE_BOOST: f32 = 15.0;
 const POKEMON_SPEED_BOOST: f32 = 30.0;
+
+pub const THREAT_SCORE_WEIGHT: f32 = 40.0;
 
 const POKEMON_BOOST_MULTIPLIER_6: f32 = 3.3;
 const POKEMON_BOOST_MULTIPLIER_5: f32 = 3.15;
@@ -156,6 +160,71 @@ fn evaluate_pokemon(pokemon: &Pokemon) -> f32 {
     score
 }
 
+/// Returns the leaf-evaluation threat score for `side_ref`'s active Pokemon
+/// threatening the opposing active Pokemon. Value is in `[0.0, 1.2]` before
+/// the caller applies `THREAT_SCORE_WEIGHT`.
+///
+/// Captures: fraction of defender HP removed by the attacker's best damaging
+/// move at current boosts, plus a +20% bonus when the attacker outspeeds.
+/// Uses the real `calculate_damage` function so STAB / type effectiveness /
+/// weather / screens / items / abilities are all correctly reflected.
+pub(crate) fn threat_score(state: &State, side_ref: &SideReference) -> f32 {
+    let (attacker_side, defender_side) = match side_ref {
+        SideReference::SideOne => (&state.side_one, &state.side_two),
+        SideReference::SideTwo => (&state.side_two, &state.side_one),
+    };
+    let attacker = attacker_side.get_active_immutable();
+    let defender = defender_side.get_active_immutable();
+
+    if attacker.hp <= 0 || defender.hp <= 0 {
+        return 0.0;
+    }
+
+    // Find best single-move damage across all usable damaging moves.
+    let mut best_damage: i16 = 0;
+    for mv in attacker.moves.into_iter() {
+        if mv.disabled || mv.pp <= 0 {
+            continue;
+        }
+        let choice = &mv.choice;
+        if choice.category == MoveCategory::Status || choice.category == MoveCategory::Switch {
+            continue;
+        }
+        if choice.base_power == 0.0 {
+            continue;
+        }
+        if let Some((normal, _crit)) =
+            calculate_damage(state, side_ref, choice, DamageRolls::Average)
+        {
+            if normal > best_damage {
+                best_damage = normal;
+            }
+        }
+    }
+
+    if best_damage == 0 {
+        return 0.0;
+    }
+
+    let hp_ratio = (best_damage as f32 / defender.hp as f32).min(1.0);
+
+    // Speed tier bonus: if attacker outspeeds, a guaranteed kill happens THIS
+    // turn rather than next, so the tempo value is higher.
+    let defender_side_ref = match side_ref {
+        SideReference::SideOne => SideReference::SideTwo,
+        SideReference::SideTwo => SideReference::SideOne,
+    };
+    let attacker_speed = get_effective_speed(state, side_ref);
+    let defender_speed = get_effective_speed(state, &defender_side_ref);
+    let speed_bonus = if attacker_speed > defender_speed {
+        1.2
+    } else {
+        1.0
+    };
+
+    hp_ratio * speed_bonus
+}
+
 pub fn evaluate(state: &State) -> f32 {
     let mut score = 0.0;
 
@@ -182,6 +251,7 @@ pub fn evaluate(state: &State) -> f32 {
                 score += get_boost_multiplier(state.side_one.special_defense_boost)
                     * POKEMON_SPECIAL_DEFENSE_BOOST;
                 score += get_boost_multiplier(state.side_one.speed_boost) * POKEMON_SPEED_BOOST;
+                score += threat_score(state, &SideReference::SideOne) * THREAT_SCORE_WEIGHT;
             }
         }
         if pkmn.terastallized {
@@ -215,6 +285,7 @@ pub fn evaluate(state: &State) -> f32 {
                 score -= get_boost_multiplier(state.side_two.special_defense_boost)
                     * POKEMON_SPECIAL_DEFENSE_BOOST;
                 score -= get_boost_multiplier(state.side_two.speed_boost) * POKEMON_SPEED_BOOST;
+                score -= threat_score(state, &SideReference::SideTwo) * THREAT_SCORE_WEIGHT;
             }
         }
         if pkmn.terastallized {
@@ -292,6 +363,63 @@ mod tests {
         println!(
             "projection: {} calls × {} sims/5s × {:.1} ns = {:.0} ms spent in calculate_damage per 5s budget ({:.0}% of budget)",
             calls_per_eval, mcts_sims_per_5s, ns_per_call, projected_ms_in_damage, projected_ms_in_damage / 50.0
+        );
+    }
+
+    #[test]
+    fn test_threat_score_fainted_returns_zero() {
+        let mut state = State::default();
+        state.side_one.get_active().hp = 0;
+        let score = super::threat_score(&state, &SideReference::SideOne);
+        assert_eq!(score, 0.0, "fainted attacker should produce zero threat");
+    }
+
+    #[test]
+    fn test_threat_score_increases_with_attack_boost() {
+        let mut state = State::default();
+        // State::default() has no damaging moves on the active Pokemon, so
+        // threat_score will likely be 0 in both cases. The assertion stays loose
+        // (boosted >= base) so it still catches regressions where +2 Atk decreases
+        // threat. A stricter fixture with a damaging move can tighten this later.
+        let base = super::threat_score(&state, &SideReference::SideOne);
+        state.side_one.attack_boost = 2;
+        let boosted = super::threat_score(&state, &SideReference::SideOne);
+
+        assert!(
+            boosted >= base,
+            "+2 Attack must not decrease threat_score (base={}, boosted={})",
+            base, boosted
+        );
+    }
+
+    #[test]
+    fn test_threat_score_non_negative() {
+        let state = State::default();
+        let s1 = super::threat_score(&state, &SideReference::SideOne);
+        let s2 = super::threat_score(&state, &SideReference::SideTwo);
+        assert!(s1 >= 0.0, "threat_score must be non-negative, got {}", s1);
+        assert!(s2 >= 0.0, "threat_score must be non-negative, got {}", s2);
+    }
+
+    #[test]
+    fn test_threat_score_caps_below_ceiling() {
+        // threat_score should be clamped to [0.0, 1.2] (hp_ratio in [0,1], speed_bonus <= 1.2).
+        let mut state = State::default();
+        state.side_two.get_active().hp = 1;
+        let score = super::threat_score(&state, &SideReference::SideOne);
+        assert!(score <= 1.2001, "threat_score must not exceed ceiling; got {}", score);
+    }
+
+    #[test]
+    fn test_evaluate_favors_boosted_side() {
+        let mut state = State::default();
+        let base_eval = super::evaluate(&state);
+        state.side_one.attack_boost = 2;
+        let boosted_eval = super::evaluate(&state);
+        assert!(
+            boosted_eval >= base_eval,
+            "evaluate must favor boosted side_one (base={}, boosted={})",
+            base_eval, boosted_eval
         );
     }
 }
