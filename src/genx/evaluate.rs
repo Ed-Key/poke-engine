@@ -241,3 +241,57 @@ pub fn evaluate(state: &State) -> f32 {
 
     score
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::choices::{Choice, Choices, MoveCategory};
+    use crate::engine::damage_calc::{calculate_damage, DamageRolls};
+    use crate::state::{PokemonType, SideReference, State};
+    use std::time::Instant;
+
+    #[test]
+    #[ignore] // run explicitly with: cargo test --release --no-default-features --features gen9 bench_calculate_damage -- --ignored --nocapture
+    fn bench_calculate_damage() {
+        let state = State::default();
+        // Default state has no real moves on the active Pokemon, so construct a
+        // representative damaging Choice directly, matching the pattern used by
+        // existing damage_calc tests (see src/genx/damage_calc.rs test_basic_damaging_move).
+        let mut attacker_choice = Choice {
+            ..Default::default()
+        };
+        attacker_choice.move_id = Choices::TACKLE;
+        attacker_choice.move_type = PokemonType::TYPELESS;
+        attacker_choice.base_power = 40.0;
+        attacker_choice.category = MoveCategory::Physical;
+
+        let iterations: u32 = 1_000_000;
+        let start = Instant::now();
+        let mut sink: i32 = 0;
+        for _ in 0..iterations {
+            let r = calculate_damage(
+                &state,
+                &SideReference::SideOne,
+                &attacker_choice,
+                DamageRolls::Average,
+            );
+            if let Some((normal, _)) = r {
+                sink = sink.wrapping_add(normal as i32);
+            }
+        }
+        let elapsed = start.elapsed();
+        let ns_per_call = elapsed.as_nanos() as f64 / iterations as f64;
+        println!(
+            "calculate_damage bench: {} calls in {:?} = {:.1} ns/call (sink={})",
+            iterations, elapsed, ns_per_call, sink
+        );
+
+        // Throughput projection
+        let calls_per_eval = 8.0; // 2 sides × up to 4 damaging moves
+        let mcts_sims_per_5s = 2_500_000.0; // current baseline
+        let projected_ms_in_damage = (ns_per_call * calls_per_eval * mcts_sims_per_5s) / 1_000_000.0;
+        println!(
+            "projection: {} calls × {} sims/5s × {:.1} ns = {:.0} ms spent in calculate_damage per 5s budget ({:.0}% of budget)",
+            calls_per_eval, mcts_sims_per_5s, ns_per_call, projected_ms_in_damage, projected_ms_in_damage / 50.0
+        );
+    }
+}
