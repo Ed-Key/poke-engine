@@ -555,7 +555,13 @@ fn capitalize_type(t: &str) -> String {
 fn serialize_pokemon(pkmn: &PokemonInput) -> String {
     let species = normalize_name(&pkmn.species);
 
-    let type1 = capitalize_type(&pkmn.types[0]);
+    // Guard empty types[] — battle-testing adapter pads teams to 6 with
+    // placeholder pokemon that have species="none" and types=[].
+    let type1 = if pkmn.types.is_empty() {
+        "Typeless".to_string()
+    } else {
+        capitalize_type(&pkmn.types[0])
+    };
     let type2 = if pkmn.types.len() > 1 {
         capitalize_type(&pkmn.types[1])
     } else {
