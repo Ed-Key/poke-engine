@@ -7,7 +7,7 @@ use rand::distr::weighted::WeightedIndex;
 use rand::prelude::*;
 use rand::rng;
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 fn sigmoid(x: f32) -> f32 {
     // Tuned so that ~200 points is very close to 1.0
@@ -314,70 +314,272 @@ fn extract_principal_variation(node: &Node, state: &mut State) -> Vec<PrincipalV
     pv
 }
 
+/// 10 million iteration safety cap (see inner-loop comment for rationale).
+const MCTS_MAX_ITERATIONS: u32 = 10_000_000;
+
+/// Batch size between wall-clock checks in the inner MCTS loop.
+const MCTS_BATCH_SIZE: u32 = 1000;
+
+/// Incremental MCTS search handle. Owns the root `Node` via `Box` so that the
+/// raw `*mut Node` parent pointers within the tree remain valid across
+/// multiple `run_for` invocations.
+///
+/// **Invariants:**
+/// - The tree is pinned on a single thread. `Node` contains raw pointers and
+///   is therefore `!Send`; `MctsSearch` inherits that constraint. Do not move
+///   across threads.
+/// - `state` represents the position at the root. During search it is mutated
+///   in place by `do_mcts` (apply -> rollout -> reverse), so between search
+///   invocations it MUST be back at root. This holds because every MCTS
+///   iteration fully unwinds instructions during backpropagation.
+pub struct MctsSearch {
+    root: Box<Node>,
+    state: State,
+    root_eval: f32,
+}
+
+impl MctsSearch {
+    /// Build a new search anchored at `state` with the given root options.
+    pub fn new(
+        state: State,
+        s1_options: Vec<MoveChoice>,
+        s2_options: Vec<MoveChoice>,
+    ) -> Self {
+        let mut root = Box::new(Node::new());
+        // SAFETY: fresh root, no aliases yet.
+        unsafe {
+            root.populate(s1_options, s2_options);
+        }
+        root.root = true;
+
+        let root_eval = evaluate(&state);
+        MctsSearch {
+            root,
+            state,
+            root_eval,
+        }
+    }
+
+    /// Run MCTS for up to `budget` of wall-clock time. Returns the number of
+    /// iterations performed in this invocation (not cumulative — see
+    /// `total_iterations` for that).
+    ///
+    /// Honours the 10-million iteration safety cap across all `run_for`
+    /// invocations on this search.
+    pub fn run_for(&mut self, budget: Duration) -> u32 {
+        let start_time = Instant::now();
+        let iterations_before = self.root.times_visited;
+        while start_time.elapsed() < budget {
+            for _ in 0..MCTS_BATCH_SIZE {
+                do_mcts(&mut self.root, &mut self.state, &self.root_eval);
+            }
+
+            // Cut off after 10 million iterations
+            //
+            // Under normal circumstances the bot will only run for 2.5-3.5 million iterations
+            // however towards the end of a battle the bot may perform tens of millions of iterations
+            //
+            // Beyond about 30 million iterations some floating point nonsense happens where
+            // MoveNode.total_score stops updating because f32 does not have enough precision
+            //
+            // I can push the problem farther out by using f64 but if the bot is running for 10 million iterations
+            // then it almost certainly sees a forced win
+            if self.root.times_visited >= MCTS_MAX_ITERATIONS {
+                break;
+            }
+        }
+        self.root.times_visited - iterations_before
+    }
+
+    /// Total cumulative MCTS iterations executed against this search.
+    pub fn total_iterations(&self) -> u32 {
+        self.root.times_visited
+    }
+
+    /// Produce a snapshot of the current best-move information. Safe to call
+    /// between `run_for` invocations; does not disturb the search tree.
+    ///
+    /// `elapsed_ms` is opaque to the search — the caller supplies whatever
+    /// wall-clock figure is meaningful (e.g. cumulative across all
+    /// `run_for` calls).
+    pub fn snapshot(&mut self, _elapsed_ms: u64) -> MctsResult {
+        // Extract principal_variation by walking the tree. This mutates state
+        // transiently but restores it before returning, matching original
+        // behavior.
+        let principal_variation =
+            extract_principal_variation(&self.root, &mut self.state);
+
+        MctsResult {
+            s1: self
+                .root
+                .s1_options
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|v| MctsSideResult {
+                    move_choice: v.move_choice.clone(),
+                    total_score: v.total_score,
+                    visits: v.visits,
+                })
+                .collect(),
+            s2: self
+                .root
+                .s2_options
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|v| MctsSideResult {
+                    move_choice: v.move_choice.clone(),
+                    total_score: v.total_score,
+                    visits: v.visits,
+                })
+                .collect(),
+            iteration_count: self.root.times_visited,
+            principal_variation,
+        }
+    }
+}
+
 pub fn perform_mcts(
     state: &mut State,
     side_one_options: Vec<MoveChoice>,
     side_two_options: Vec<MoveChoice>,
     max_time: Duration,
 ) -> MctsResult {
-    let mut root_node = Node::new();
-    unsafe {
-        root_node.populate(side_one_options, side_two_options);
-    }
-    root_node.root = true;
+    // `State: Clone` — the old implementation held a &mut State and mutated
+    // the original in place. MctsSearch owns its State (required because it
+    // may live across multiple run_for calls). Since every MCTS iteration
+    // fully restores state via backpropagation's reverse_instructions, the
+    // caller's State is observationally unchanged at the end of this
+    // function either way. We clone once at entry to preserve the old
+    // "caller hands us a mut reference" signature.
+    let _ = state; // keep &mut in signature for API stability
+    let mut search = MctsSearch::new(state.clone(), side_one_options, side_two_options);
+    let start = Instant::now();
+    search.run_for(max_time);
+    search.snapshot(start.elapsed().as_millis() as u64)
+}
 
-    let root_eval = evaluate(state);
-    let start_time = std::time::Instant::now();
-    while start_time.elapsed() < max_time {
-        for _ in 0..1000 {
-            do_mcts(&mut root_node, state, &root_eval);
-        }
+#[cfg(test)]
+mod stream_tests {
+    use super::*;
 
-        /*
-        Cut off after 10 million iterations
+    /// Exercise the MctsSearch incremental API: build, run twice, verify
+    /// iterations accumulate and snapshot is well-formed. Uses a very short
+    /// budget for test hygiene but long enough that at least one
+    /// MCTS_BATCH_SIZE of iterations completes.
+    #[test]
+    fn mcts_search_incremental_api() {
+        use crate::translate::json_to_poke_state;
 
-        Under normal circumstances the bot will only run for 2.5-3.5 million iterations
-        however towards the end of a battle the bot may perform tens of millions of iterations
+        let json = r#"{
+            "sideOne": {
+                "pokemon": [
+                    {
+                        "species": "Blaziken",
+                        "level": 100,
+                        "types": ["Fire", "Fighting"],
+                        "hp": 302,
+                        "maxhp": 302,
+                        "ability": "Speed Boost",
+                        "item": "Life Orb",
+                        "nature": "Jolly",
+                        "attack": 349,
+                        "defense": 196,
+                        "specialAttack": 230,
+                        "specialDefense": 176,
+                        "speed": 284,
+                        "status": "None",
+                        "weightKg": 52.0,
+                        "moves": [
+                            {"id": "Close Combat", "pp": 8},
+                            {"id": "Flare Blitz", "pp": 24},
+                            {"id": "Swords Dance", "pp": 32},
+                            {"id": "Knock Off", "pp": 32}
+                        ],
+                        "teraType": "Fire"
+                    }
+                ],
+                "activeIndex": 0
+            },
+            "sideTwo": {
+                "pokemon": [
+                    {
+                        "species": "Alakazam",
+                        "level": 100,
+                        "types": ["Psychic"],
+                        "hp": 251,
+                        "maxhp": 251,
+                        "ability": "Magic Guard",
+                        "item": "Focus Sash",
+                        "nature": "Timid",
+                        "attack": 121,
+                        "defense": 128,
+                        "specialAttack": 369,
+                        "specialDefense": 206,
+                        "speed": 372,
+                        "status": "None",
+                        "weightKg": 48.0,
+                        "moves": [
+                            {"id": "Psychic", "pp": 16},
+                            {"id": "Shadow Ball", "pp": 24},
+                            {"id": "Focus Blast", "pp": 8},
+                            {"id": "Energy Ball", "pp": 16}
+                        ],
+                        "teraType": "Psychic"
+                    }
+                ],
+                "activeIndex": 0
+            }
+        }"#;
 
-        Beyond about 30 million iterations some floating point nonsense happens where
-        MoveNode.total_score stops updating because f32 does not have enough precision
+        let state = json_to_poke_state(json).expect("parse state");
+        let (s1_opts, s2_opts) = state.root_get_all_options();
+        assert!(!s1_opts.is_empty());
 
-        I can push the problem farther out by using f64 but if the bot is running for 10 million iterations
-        then it almost certainly sees a forced win
-        */
-        if root_node.times_visited == 10_000_000 {
-            break;
-        }
-    }
+        let mut search = MctsSearch::new(state.clone(), s1_opts, s2_opts);
 
-    let principal_variation = extract_principal_variation(&root_node, state);
+        // First slice
+        search.run_for(Duration::from_millis(150));
+        let sims_1 = search.total_iterations();
+        assert!(sims_1 > 0, "first run_for should have produced iterations");
 
-    let result = MctsResult {
-        s1: root_node
-            .s1_options
-            .as_ref()
-            .unwrap()
+        let snap_1 = search.snapshot(150);
+        assert!(
+            !snap_1.s1.is_empty(),
+            "snapshot s1 results should not be empty"
+        );
+        let best_1 = snap_1
+            .s1
             .iter()
-            .map(|v| MctsSideResult {
-                move_choice: v.move_choice.clone(),
-                total_score: v.total_score,
-                visits: v.visits,
-            })
-            .collect(),
-        s2: root_node
-            .s2_options
-            .as_ref()
-            .unwrap()
-            .iter()
-            .map(|v| MctsSideResult {
-                move_choice: v.move_choice.clone(),
-                total_score: v.total_score,
-                visits: v.visits,
-            })
-            .collect(),
-        iteration_count: root_node.times_visited,
-        principal_variation,
-    };
+            .max_by_key(|r| r.visits)
+            .expect("best move");
+        assert!(best_1.visits > 0, "best move should have visits");
 
-    result
+        // Second slice — iterations should accumulate
+        search.run_for(Duration::from_millis(150));
+        let sims_2 = search.total_iterations();
+        assert!(
+            sims_2 > sims_1,
+            "iterations should accumulate across run_for calls: sims_1={} sims_2={}",
+            sims_1,
+            sims_2
+        );
+
+        let snap_2 = search.snapshot(300);
+        let best_2 = snap_2
+            .s1
+            .iter()
+            .max_by_key(|r| r.visits)
+            .expect("best move");
+        assert!(
+            best_2.visits >= best_1.visits,
+            "best move visits should grow or stay equal across snapshots"
+        );
+        assert_eq!(
+            snap_2.iteration_count,
+            search.total_iterations(),
+            "snapshot iteration_count must match total_iterations"
+        );
+    }
 }
