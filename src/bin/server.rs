@@ -10,6 +10,7 @@ use poke_engine::mcts::{perform_mcts, MctsResult, MctsSearch};
 use poke_engine::translate::auto_detect_and_parse;
 use serde::Serialize;
 use std::time::{Duration, Instant};
+use tower_http::cors::{Any, CorsLayer};
 
 const DEFAULT_PORT: u16 = 7267;
 const DEFAULT_TIME_LIMIT_MS: u64 = 5000;
@@ -407,10 +408,18 @@ async fn analyze_stream_handler(body: String) -> impl IntoResponse {
 
 #[tokio::main]
 async fn main() {
+    // Permissive CORS: server is localhost-only, no security concern.
+    // Needed so browser extensions / userscripts / dev tools can fetch directly.
+    let cors = CorsLayer::new()
+        .allow_methods(Any)
+        .allow_headers(Any)
+        .allow_origin(Any);
+
     let app = Router::new()
         .route("/status", get(status_handler))
         .route("/analyze", post(analyze_handler))
-        .route("/analyze/stream", post(analyze_stream_handler));
+        .route("/analyze/stream", post(analyze_stream_handler))
+        .layer(cors);
 
     let addr = format!("0.0.0.0:{}", DEFAULT_PORT);
     println!("poke-engine MCTS server starting on {}", addr);
