@@ -290,12 +290,14 @@ fn error_stream_update(msg: String) -> StreamUpdate {
 
 async fn analyze_stream_handler(body: String) -> impl IntoResponse {
     // Parse out optional timing overrides from the request body. Defaults
-    // mirror /analyze (timeLimit -> 5000ms) plus a new updateIntervalMs
-    // (250ms).
+    // are 5000ms for the time limit and 250ms for the update interval.
+    // NOTE: this endpoint uses `timeLimitMs` / `updateIntervalMs` to match
+    // the Python EngineClient. The legacy `/analyze` endpoint still uses
+    // `timeLimit` (no Ms suffix) per the Cobblemon mod contract.
     let parsed = serde_json::from_str::<serde_json::Value>(&body).ok();
     let time_limit_ms = parsed
         .as_ref()
-        .and_then(|v| v.get("timeLimit")?.as_u64())
+        .and_then(|v| v.get("timeLimitMs")?.as_u64())
         .unwrap_or(DEFAULT_TIME_LIMIT_MS);
     let update_interval_ms = parsed
         .as_ref()
