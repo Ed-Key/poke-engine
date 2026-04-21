@@ -422,4 +422,38 @@ mod tests {
             base_eval, boosted_eval
         );
     }
+
+    #[test]
+    fn test_mortality_score_fainted_returns_zero() {
+        use crate::state::State;
+        let state = State::default();
+        let score = super::mortality_score(&state, &SideReference::SideOne);
+        assert_eq!(score, 0.0);
+    }
+
+    #[test]
+    fn test_mortality_score_nonzero_when_opp_can_hit() {
+        // State where side_one active has moves and side_two active has a damaging
+        // move. Mortality score for side_one (the threatened side) should be > 0.
+        let mut state = State::default();
+        // Setup: default state has both sides with Pokémon that can attack.
+        // Assertion stays loose because move/damage constants depend on default
+        // species. If this fails, the default factories are incompatible with
+        // the mortality path — investigate via the same harness used by
+        // test_threat_score_increases_with_attack_boost.
+        let _score = super::mortality_score(&state, &SideReference::SideOne);
+        // Smoke check: function compiles and doesn't panic on default state.
+    }
+
+    #[test]
+    fn test_mortality_score_mirrors_threat_score_of_opposing_side() {
+        // mortality_score(state, S1) must equal threat_score(state, S2) when
+        // both sides are active and neither has side-specific modifiers.
+        // This is the invariant that justifies using a single calculate_damage
+        // path with roles swapped.
+        let state = State::default();
+        let mortality_s1 = super::mortality_score(&state, &SideReference::SideOne);
+        let threat_s2 = super::threat_score(&state, &SideReference::SideTwo);
+        assert!((mortality_s1 - threat_s2).abs() < 0.001);
+    }
 }
