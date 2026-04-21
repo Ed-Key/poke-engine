@@ -17,6 +17,7 @@ const POKEMON_SPECIAL_DEFENSE_BOOST: f32 = 15.0;
 const POKEMON_SPEED_BOOST: f32 = 30.0;
 
 pub const THREAT_SCORE_WEIGHT: f32 = 40.0;
+pub const MORTALITY_SCORE_WEIGHT: f32 = 40.0;
 
 const POKEMON_BOOST_MULTIPLIER_6: f32 = 3.3;
 const POKEMON_BOOST_MULTIPLIER_5: f32 = 3.15;
@@ -225,6 +226,23 @@ pub(crate) fn threat_score(state: &State, side_ref: &SideReference) -> f32 {
     hp_ratio * speed_bonus
 }
 
+/// Returns the leaf-evaluation mortality score for `side_ref`'s active Pokemon
+/// being threatened by the opposing active Pokemon. Value is in `[0.0, 1.2]`
+/// before the caller applies `MORTALITY_SCORE_WEIGHT`.
+///
+/// Captures: fraction of our attacker's HP removed by opp's best damaging move
+/// at current boosts, +20% when opp outspeeds (the KO happens THIS turn).
+///
+/// This is exactly `threat_score` with attacker/defender roles swapped, so
+/// `mortality_score(state, S1) == threat_score(state, S2)` by construction.
+pub(crate) fn mortality_score(state: &State, side_ref: &SideReference) -> f32 {
+    let opposing = match side_ref {
+        SideReference::SideOne => SideReference::SideTwo,
+        SideReference::SideTwo => SideReference::SideOne,
+    };
+    threat_score(state, &opposing)
+}
+
 pub fn evaluate(state: &State) -> f32 {
     let mut score = 0.0;
 
@@ -425,35 +443,27 @@ mod tests {
 
     #[test]
     fn test_mortality_score_fainted_returns_zero() {
-        use crate::state::State;
-        let state = State::default();
+        let mut state = State::default();
+        state.side_two.get_active().hp = 0;
         let score = super::mortality_score(&state, &SideReference::SideOne);
-        assert_eq!(score, 0.0);
+        assert_eq!(score, 0.0, "fainted opposing attacker should produce zero mortality");
     }
 
     #[test]
     fn test_mortality_score_nonzero_when_opp_can_hit() {
-        // State where side_one active has moves and side_two active has a damaging
-        // move. Mortality score for side_one (the threatened side) should be > 0.
-        let mut state = State::default();
-        // Setup: default state has both sides with Pokémon that can attack.
-        // Assertion stays loose because move/damage constants depend on default
-        // species. If this fails, the default factories are incompatible with
-        // the mortality path — investigate via the same harness used by
-        // test_threat_score_increases_with_attack_boost.
+        let state = State::default();
         let _score = super::mortality_score(&state, &SideReference::SideOne);
         // Smoke check: function compiles and doesn't panic on default state.
     }
 
     #[test]
     fn test_mortality_score_mirrors_threat_score_of_opposing_side() {
-        // mortality_score(state, S1) must equal threat_score(state, S2) when
-        // both sides are active and neither has side-specific modifiers.
-        // This is the invariant that justifies using a single calculate_damage
-        // path with roles swapped.
         let state = State::default();
         let mortality_s1 = super::mortality_score(&state, &SideReference::SideOne);
         let threat_s2 = super::threat_score(&state, &SideReference::SideTwo);
-        assert!((mortality_s1 - threat_s2).abs() < 0.001);
+        assert!(
+            (mortality_s1 - threat_s2).abs() < 0.001,
+            "mortality_s1={} must mirror threat_s2={}", mortality_s1, threat_s2
+        );
     }
 }
