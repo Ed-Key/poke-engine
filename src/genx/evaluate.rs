@@ -270,6 +270,7 @@ pub fn evaluate(state: &State) -> f32 {
                     * POKEMON_SPECIAL_DEFENSE_BOOST;
                 score += get_boost_multiplier(state.side_one.speed_boost) * POKEMON_SPEED_BOOST;
                 score += threat_score(state, &SideReference::SideOne) * THREAT_SCORE_WEIGHT;
+                score -= mortality_score(state, &SideReference::SideOne) * MORTALITY_SCORE_WEIGHT;
             }
         }
         if pkmn.terastallized {
@@ -304,6 +305,7 @@ pub fn evaluate(state: &State) -> f32 {
                     * POKEMON_SPECIAL_DEFENSE_BOOST;
                 score -= get_boost_multiplier(state.side_two.speed_boost) * POKEMON_SPEED_BOOST;
                 score -= threat_score(state, &SideReference::SideTwo) * THREAT_SCORE_WEIGHT;
+                score += mortality_score(state, &SideReference::SideTwo) * MORTALITY_SCORE_WEIGHT;
             }
         }
         if pkmn.terastallized {
