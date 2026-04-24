@@ -1,10 +1,10 @@
 use super::abilities::Abilities;
 use super::items::Items;
 use super::state::PokemonVolatileStatus;
-use crate::choices::MoveCategory;
+use crate::choices::{MoveCategory, MoveTarget};
 use crate::engine::damage_calc::{calculate_damage, DamageRolls};
-use crate::engine::generate_instructions::get_effective_speed;
-use crate::state::{Pokemon, PokemonStatus, Side, SideReference, State};
+use crate::engine::generate_instructions::{get_effective_speed, immune_to_status};
+use crate::state::{Pokemon, PokemonStatus, PokemonType, Side, SideReference, State};
 
 const POKEMON_ALIVE: f32 = 30.0;
 const POKEMON_HP: f32 = 100.0;
@@ -18,6 +18,7 @@ const POKEMON_SPEED_BOOST: f32 = 30.0;
 
 pub const THREAT_SCORE_WEIGHT: f32 = 40.0;
 pub const MORTALITY_SCORE_WEIGHT: f32 = 20.0;
+pub const STATUS_THREAT_WEIGHT: f32 = 25.0;
 
 const POKEMON_BOOST_MULTIPLIER_6: f32 = 3.3;
 const POKEMON_BOOST_MULTIPLIER_5: f32 = 3.15;
@@ -243,6 +244,87 @@ pub(crate) fn mortality_score(state: &State, side_ref: &SideReference) -> f32 {
     threat_score(state, &opposing)
 }
 
+/// Returns the leaf-evaluation status-threat score for `side_ref`'s active
+/// Pokemon — how much eval-value the side can expect to gain by landing a
+/// non-damaging status move on the opposing active. Value in `[0.0, 1.6]`
+/// before the caller applies `STATUS_THREAT_WEIGHT`.
+///
+/// Rewards the existence of an applicable status move so MCTS doesn't pick
+/// a 0x-damage move over Sleep Powder / Will-O-Wisp / Leech Seed just
+/// because threat_score is blind to status. Accuracy-weighted and checks
+/// `immune_to_status` (type / ability / terrain / Substitute / Safeguard /
+/// sleep clause) so Grass mons don't get credit for Sleep Powder etc.
+pub(crate) fn status_threat_score(state: &State, side_ref: &SideReference) -> f32 {
+    let (attacker_side, defender_side_ref) = match side_ref {
+        SideReference::SideOne => (&state.side_one, SideReference::SideTwo),
+        SideReference::SideTwo => (&state.side_two, SideReference::SideOne),
+    };
+    let attacker = attacker_side.get_active_immutable();
+    if attacker.hp <= 0 {
+        return 0.0;
+    }
+    let defender_side = match defender_side_ref {
+        SideReference::SideOne => &state.side_one,
+        SideReference::SideTwo => &state.side_two,
+    };
+    let defender = defender_side.get_active_immutable();
+    if defender.hp <= 0 {
+        return 0.0;
+    }
+
+    let mut best: f32 = 0.0;
+    for mv in attacker.moves.into_iter() {
+        if mv.disabled || mv.pp <= 0 {
+            continue;
+        }
+        let choice = &mv.choice;
+        if choice.category != MoveCategory::Status {
+            continue;
+        }
+        let accuracy = (choice.accuracy / 100.0).min(1.0);
+
+        // Primary status (Sleep Powder, Thunder Wave, Will-O-Wisp, Toxic, ...).
+        if let Some(status_spec) = &choice.status {
+            if status_spec.target == MoveTarget::Opponent
+                && !immune_to_status(state, &status_spec.target, &defender_side_ref, &status_spec.status)
+            {
+                let value = match status_spec.status {
+                    PokemonStatus::SLEEP => 1.0,
+                    PokemonStatus::BURN => 1.0,
+                    PokemonStatus::PARALYZE => 1.0,
+                    PokemonStatus::TOXIC => 1.2,
+                    PokemonStatus::POISON => 0.4,
+                    PokemonStatus::FREEZE => 1.6,
+                    PokemonStatus::NONE => 0.0,
+                };
+                let contribution = accuracy * value;
+                if contribution > best {
+                    best = contribution;
+                }
+            }
+        }
+
+        // Volatile-status primary moves — Leech Seed specifically, which
+        // mirrors the -30 LEECH_SEED leaf penalty. Grass-type immunity and
+        // an already-seeded check avoid double-counting.
+        if let Some(vs_spec) = &choice.volatile_status {
+            if vs_spec.target == MoveTarget::Opponent
+                && vs_spec.volatile_status == PokemonVolatileStatus::LEECHSEED
+                && !defender.has_type(&PokemonType::GRASS)
+                && !defender_side
+                    .volatile_statuses
+                    .contains(&PokemonVolatileStatus::LEECHSEED)
+            {
+                let contribution = accuracy * 1.2; // 30 / 25 (STATUS_THREAT_WEIGHT)
+                if contribution > best {
+                    best = contribution;
+                }
+            }
+        }
+    }
+    best
+}
+
 pub fn evaluate(state: &State) -> f32 {
     let mut score = 0.0;
 
@@ -271,6 +353,7 @@ pub fn evaluate(state: &State) -> f32 {
                 score += get_boost_multiplier(state.side_one.speed_boost) * POKEMON_SPEED_BOOST;
                 score += threat_score(state, &SideReference::SideOne) * THREAT_SCORE_WEIGHT;
                 score -= mortality_score(state, &SideReference::SideOne) * MORTALITY_SCORE_WEIGHT;
+                score += status_threat_score(state, &SideReference::SideOne) * STATUS_THREAT_WEIGHT;
             }
         }
         if pkmn.terastallized {
@@ -306,6 +389,7 @@ pub fn evaluate(state: &State) -> f32 {
                 score -= get_boost_multiplier(state.side_two.speed_boost) * POKEMON_SPEED_BOOST;
                 score -= threat_score(state, &SideReference::SideTwo) * THREAT_SCORE_WEIGHT;
                 score += mortality_score(state, &SideReference::SideTwo) * MORTALITY_SCORE_WEIGHT;
+                score -= status_threat_score(state, &SideReference::SideTwo) * STATUS_THREAT_WEIGHT;
             }
         }
         if pkmn.terastallized {
