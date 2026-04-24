@@ -40,6 +40,8 @@ pub struct SideInput {
     pub boosts: Option<BoostsInput>,
     #[serde(default = "default_false")]
     pub force_trapped: bool,
+    #[serde(default = "default_false")]
+    pub force_switch: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -433,6 +435,7 @@ fn fabric_aux_side_to_input(side: &FabricAuxSide) -> SideInput {
         volatile_statuses: None,
         boosts,
         force_trapped: false,
+        force_switch: false,
     }
 }
 
@@ -450,6 +453,7 @@ pub fn from_fabric_aux(state: &FabricAuxState) -> State {
             volatile_statuses: None,
             boosts: None,
             force_trapped: false,
+            force_switch: false,
         }
     };
 
@@ -463,6 +467,7 @@ pub fn from_fabric_aux(state: &FabricAuxState) -> State {
             volatile_statuses: None,
             boosts: None,
             force_trapped: false,
+            force_switch: false,
         }
     };
 
@@ -767,7 +772,7 @@ fn serialize_side(side: &SideInput) -> String {
         0,                          // [19] wish hp
         0,                          // [20] future sight turns
         0,                          // [21] future sight pokemon_index
-        false,                      // [22] force_switch
+        side.force_switch,          // [22] force_switch
         "NONE",                     // [23] switch_out_move
         false,                      // [24] baton_passing
         false,                      // [25] shed_tailing
