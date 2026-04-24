@@ -582,4 +582,145 @@ mod stream_tests {
             "snapshot iteration_count must match total_iterations"
         );
     }
+
+    /// Reproduce the live-bug scenario: Iron Hands (Electric/Fighting) at 34% HP
+    /// vs Togekiss (Fairy/Flying) at 10% HP. Iron Hands should NEVER prefer
+    /// Earthquake since Ground does 0 damage to Flying defenders.
+    ///
+    /// Empirical result (gen9, release): calculate_damage correctly returns 0 for
+    /// EQ vs Flying, threat_score correctly finds ThunderPunch (344 dmg) as best,
+    /// and MCTS correctly selects DrainPunch/ThunderPunch (≈3.6M visits each)
+    /// over EQ (≈470 visits). The live-battle Earthquake selection must have
+    /// some other cause (e.g. serialization mismatch, snapshot at <1ms, or
+    /// payload differing from reported summary). This test serves as a
+    /// regression guard for the primitive pipeline.
+    #[test]
+    fn repro_iron_hands_vs_togekiss_never_picks_earthquake() {
+        use crate::translate::json_to_poke_state;
+
+        // Togekiss typical stats: HP 310 (so 10% ~= 31). Iron Hands Atk ~419.
+        // Using approximate competitive stats. The exact numbers don't matter
+        // for the type-effectiveness conclusion (EQ = 0 dmg regardless).
+        let json = r#"{
+            "sideOne": {
+                "pokemon": [
+                    {
+                        "species": "IronHands",
+                        "level": 100,
+                        "types": ["Electric", "Fighting"],
+                        "hp": 180,
+                        "maxhp": 527,
+                        "ability": "QuarkDrive",
+                        "item": "Assault Vest",
+                        "nature": "Adamant",
+                        "attack": 419,
+                        "defense": 203,
+                        "specialAttack": 130,
+                        "specialDefense": 237,
+                        "speed": 113,
+                        "status": "None",
+                        "weightKg": 380.7,
+                        "moves": [
+                            {"id": "Drain Punch", "pp": 16},
+                            {"id": "Thunder Punch", "pp": 24},
+                            {"id": "Ice Punch", "pp": 24},
+                            {"id": "Earthquake", "pp": 16}
+                        ],
+                        "teraType": "Electric"
+                    }
+                ],
+                "activeIndex": 0
+            },
+            "sideTwo": {
+                "pokemon": [
+                    {
+                        "species": "Togekiss",
+                        "level": 100,
+                        "types": ["Fairy", "Flying"],
+                        "hp": 31,
+                        "maxhp": 310,
+                        "ability": "Serene Grace",
+                        "item": "Leftovers",
+                        "nature": "Timid",
+                        "attack": 157,
+                        "defense": 216,
+                        "specialAttack": 295,
+                        "specialDefense": 237,
+                        "speed": 236,
+                        "status": "None",
+                        "weightKg": 38.0,
+                        "moves": [
+                            {"id": "Air Slash", "pp": 24},
+                            {"id": "Dazzling Gleam", "pp": 16},
+                            {"id": "Flamethrower", "pp": 24},
+                            {"id": "Roost", "pp": 16}
+                        ],
+                        "teraType": "Fairy"
+                    }
+                ],
+                "activeIndex": 0
+            }
+        }"#;
+
+        let state = json_to_poke_state(json).expect("parse state");
+        let (s1_opts, s2_opts) = state.root_get_all_options();
+        let s1_move_names: Vec<String> = s1_opts
+            .iter()
+            .map(|mc| mc.to_string(&state.side_one))
+            .collect();
+        eprintln!("side_one move options: {:?}", s1_move_names);
+
+        // Also directly check what calculate_damage says for each move from this state.
+        use crate::engine::damage_calc::{calculate_damage, DamageRolls};
+        use crate::state::SideReference;
+        for (idx, mv) in state.side_one.get_active_immutable().moves.into_iter().enumerate() {
+            let dmg = calculate_damage(&state, &SideReference::SideOne, &mv.choice, DamageRolls::Average);
+            eprintln!(
+                "move[{}] id={:?} type={:?} base_power={} -> dmg={:?}",
+                idx, mv.choice.move_id, mv.choice.move_type, mv.choice.base_power, dmg
+            );
+        }
+
+        // Check the threat_score output too.
+        let ts = crate::engine::evaluate::threat_score(&state, &SideReference::SideOne);
+        eprintln!("threat_score(SideOne) = {}", ts);
+
+        let mut search = MctsSearch::new(state.clone(), s1_opts, s2_opts);
+        // Short slice first to show early-iteration noise
+        search.run_for(Duration::from_millis(50));
+        let snap_early = search.snapshot(50);
+        eprintln!("=== 50ms snapshot ===");
+        for (i, r) in snap_early.s1.iter().enumerate() {
+            let avg = if r.visits > 0 { r.total_score / r.visits as f32 } else { 0.0 };
+            let name = s1_move_names.get(i).cloned().unwrap_or_default();
+            eprintln!(
+                "s1[{}] {:<20} visits={:<8} total_score={:.3} avg={:.4}",
+                i, name, r.visits, r.total_score, avg
+            );
+        }
+
+        search.run_for(Duration::from_millis(5000));
+        let snap = search.snapshot(5050);
+        eprintln!("=== 5050ms snapshot ===");
+
+        eprintln!("iterations: {}", snap.iteration_count);
+        for (i, r) in snap.s1.iter().enumerate() {
+            let avg = if r.visits > 0 { r.total_score / r.visits as f32 } else { 0.0 };
+            let name = s1_move_names.get(i).cloned().unwrap_or_default();
+            eprintln!(
+                "s1[{}] {:<20} visits={:<8} total_score={:.3} avg={:.4}",
+                i, name, r.visits, r.total_score, avg
+            );
+        }
+
+        // Determine which s1 move has the most visits (that's what the engine picks).
+        let best = snap.s1.iter().enumerate().max_by_key(|(_, r)| r.visits).unwrap();
+        let best_name = s1_move_names[best.0].to_lowercase().replace(' ', "");
+        eprintln!("engine best move: {} (visits={})", best_name, best.1.visits);
+        assert!(
+            !best_name.contains("earthquake"),
+            "Engine must not pick Earthquake against Flying target. Got {}",
+            best_name
+        );
+    }
 }

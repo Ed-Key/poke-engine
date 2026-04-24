@@ -691,6 +691,61 @@ mod tests {
         assert_eq!(32, dmg.unwrap().0);
     }
 
+    // DIAGNOSTIC: Earthquake (Ground) vs a Flying defender must produce 0 damage.
+    // If this returns nonzero, the type-matchup pipeline has a regression.
+    #[test]
+    fn diag_earthquake_vs_flying_is_zero() {
+        let mut state = State::default();
+        // Set defender types to (Fairy, Flying) to mirror Togekiss
+        state.side_two.get_active().types =
+            (PokemonType::FAIRY, PokemonType::FLYING);
+        let mut choice = Choice {
+            ..Default::default()
+        };
+        choice.move_id = Choices::EARTHQUAKE;
+        choice.move_type = PokemonType::GROUND;
+        choice.base_power = 100.0;
+        choice.category = MoveCategory::Physical;
+
+        let dmg = calculate_damage(
+            &state,
+            &SideReference::SideOne,
+            &choice,
+            DamageRolls::Average,
+        );
+
+        let (normal, crit) = dmg.unwrap();
+        eprintln!("EQ vs Flying: normal={} crit={}", normal, crit);
+        assert_eq!(0, normal, "Ground vs Flying must be 0 damage");
+    }
+
+    // DIAGNOSTIC: Thunder Punch (Electric) vs Fairy/Flying should deal STRONG damage
+    // (2x on Flying, 1x on Fairy => 2x net). Should trivially out-damage Earthquake (0x).
+    #[test]
+    fn diag_thunderpunch_vs_fairy_flying() {
+        let mut state = State::default();
+        state.side_two.get_active().types =
+            (PokemonType::FAIRY, PokemonType::FLYING);
+        let mut choice = Choice {
+            ..Default::default()
+        };
+        choice.move_id = Choices::THUNDERPUNCH;
+        choice.move_type = PokemonType::ELECTRIC;
+        choice.base_power = 75.0;
+        choice.category = MoveCategory::Physical;
+
+        let dmg = calculate_damage(
+            &state,
+            &SideReference::SideOne,
+            &choice,
+            DamageRolls::Average,
+        );
+
+        let (normal, crit) = dmg.unwrap();
+        eprintln!("TPunch vs Fairy/Flying: normal={} crit={}", normal, crit);
+        assert!(normal > 0, "Electric vs Flying must be >0");
+    }
+
     #[test]
     fn test_basic_non_damaging_move() {
         let state = State::default();
