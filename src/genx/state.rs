@@ -236,7 +236,8 @@ define_enum_with_from_str! {
         SNOW,
         HARSHSUN,
         HEAVYRAIN,
-    }
+    },
+    default = NONE
 }
 
 define_enum_with_from_str! {
@@ -248,7 +249,8 @@ define_enum_with_from_str! {
         PSYCHICTERRAIN,
         MISTYTERRAIN,
         GRASSYTERRAIN,
-    }
+    },
+    default = NONE
 }
 
 impl Pokemon {
