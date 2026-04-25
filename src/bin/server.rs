@@ -421,7 +421,11 @@ async fn main() {
         .route("/analyze/stream", post(analyze_stream_handler))
         .layer(cors);
 
-    let addr = format!("0.0.0.0:{}", DEFAULT_PORT);
+    let port: u16 = std::env::var("PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_PORT);
+    let addr = format!("0.0.0.0:{}", port);
     println!("poke-engine MCTS server starting on {}", addr);
 
     let listener = tokio::net::TcpListener::bind(&addr)
