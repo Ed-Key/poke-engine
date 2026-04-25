@@ -504,11 +504,19 @@ pub fn aggregate_pimc(
     // 2. Find top weighted score; filter to within 75% of top.
     let top = weighted.values().copied().fold(f32::MIN, f32::max);
     let threshold = top * 0.75;
-    let survivors: Vec<(MoveChoice, f32)> = weighted
+    let mut survivors: Vec<(MoveChoice, f32)> = weighted
         .iter()
         .filter(|(_, w)| **w >= threshold)
         .map(|(mc, w)| (*mc, *w))
         .collect();
+    // HashMap iteration order is non-deterministic, but seeded sampling needs a
+    // stable ordering so the same seed always picks the same survivor. Sort by
+    // weight desc, breaking ties by Debug-string of MoveChoice (gives a total order).
+    survivors.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| format!("{:?}", a.0).cmp(&format!("{:?}", b.0)))
+    });
 
     // 3. Pick winner.
     //    `partial_cmp(...).unwrap()` is safe: weights are `share / k` where
@@ -558,7 +566,8 @@ pub fn aggregate_pimc(
         match (a_is_winner, b_is_winner) {
             (true, false) => std::cmp::Ordering::Less,
             (false, true) => std::cmp::Ordering::Greater,
-            _ => b.visits.cmp(&a.visits),
+            _ => b.visits.cmp(&a.visits)
+                .then_with(|| format!("{:?}", a.move_choice).cmp(&format!("{:?}", b.move_choice))),
         }
     });
 
@@ -576,7 +585,8 @@ pub fn aggregate_pimc(
         }
     }
     let mut agg_s2: Vec<MctsSideResult> = agg_s2_map.into_values().collect();
-    agg_s2.sort_by(|a, b| b.visits.cmp(&a.visits));
+    agg_s2.sort_by(|a, b| b.visits.cmp(&a.visits)
+        .then_with(|| format!("{:?}", a.move_choice).cmp(&format!("{:?}", b.move_choice))));
 
     let iteration_count: u32 = results.iter().map(|r| r.iteration_count).sum();
 
