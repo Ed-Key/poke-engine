@@ -195,6 +195,14 @@ pub(crate) fn threat_score(state: &State, side_ref: &SideReference) -> f32 {
         if choice.base_power == 0.0 {
             continue;
         }
+        // Fix B Rule 1: priority moves are blocked by Psychic Terrain on grounded opp.
+        if choice.priority > 0
+            && state.terrain.terrain_type == crate::engine::state::Terrain::PSYCHICTERRAIN
+            && state.terrain.turns_remaining > 0
+            && defender.is_grounded()
+        {
+            continue;
+        }
         if let Some((normal, _crit)) =
             calculate_damage(state, side_ref, choice, DamageRolls::Average)
         {
@@ -551,5 +559,49 @@ mod tests {
             (mortality_s1 - threat_s2).abs() < 0.001,
             "mortality_s1={} must mirror threat_s2={}", mortality_s1, threat_s2
         );
+    }
+
+    #[test]
+    fn test_fixB_priority_move_zeroed_under_psyterrain() {
+        // Setup: side_one's active has Sucker Punch (priority +1), defender is grounded,
+        // Psychic Terrain is up. threat_score should ignore Sucker Punch even if it
+        // would do damage on raw type matchup.
+        use crate::choices::Choices;
+        use crate::engine::state::Terrain;
+
+        let mut state = State::default();
+        // Force a Sucker-Punch-like priority move into slot 0 of side_one's active.
+        let active = state.side_one.get_active();
+        active.moves.m0.id = Choices::SUCKERPUNCH;
+        active.moves.m0.disabled = false;
+        active.moves.m0.pp = 16;
+        // Re-resolve choice so move_id, priority etc. line up:
+        active.moves.m0.choice = crate::choices::MOVES.get(&Choices::SUCKERPUNCH).unwrap().clone();
+
+        // Disable the rest so they don't dominate the score.
+        active.moves.m1.disabled = true;
+        active.moves.m2.disabled = true;
+        active.moves.m3.disabled = true;
+
+        // Activate Psychic Terrain.
+        state.terrain.terrain_type = Terrain::PSYCHICTERRAIN;
+        state.terrain.turns_remaining = 5;
+
+        // Defender must be grounded (default state defender already is — no Levitate, no Flying).
+        // Verify: side_two.get_active().is_grounded() should be true.
+        assert!(state.side_two.get_active_immutable().is_grounded(),
+                "test setup invalid: defender should be grounded");
+
+        let score = super::threat_score(&state, &SideReference::SideOne);
+        assert_eq!(score, 0.0, "priority move on grounded target under Psychic Terrain must score 0");
+
+        // Negative control: flip terrain off, same setup must now score > 0
+        // (proves the zero above came from the Rule 1 guard, not a broken fixture).
+        state.terrain.terrain_type = Terrain::NONE;
+        state.terrain.turns_remaining = 0;
+        let score_no_terrain = super::threat_score(&state, &SideReference::SideOne);
+        assert!(score_no_terrain > 0.0,
+                "without Psychic Terrain, Sucker Punch must score > 0 (got {})",
+                score_no_terrain);
     }
 }
