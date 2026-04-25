@@ -296,6 +296,15 @@ pub(crate) fn status_threat_score(state: &State, side_ref: &SideReference) -> f3
         {
             continue;
         }
+        // Fix B Rule 3: Toxic / Poison on Poison Heal opp gives them sustain.
+        if let Some(status_spec) = &choice.status {
+            if (status_spec.status == PokemonStatus::TOXIC
+                || status_spec.status == PokemonStatus::POISON)
+                && defender.ability == Abilities::POISONHEAL
+            {
+                continue;
+            }
+        }
         let accuracy = (choice.accuracy / 100.0).min(1.0);
 
         // Primary status (Sleep Powder, Thunder Wave, Will-O-Wisp, Toxic, ...).
@@ -645,5 +654,43 @@ mod tests {
         assert!(score_normal > 0.0,
                 "Sleep Powder on Normal-type must score > 0 (got {})",
                 score_normal);
+    }
+
+    #[test]
+    fn test_fixB_toxic_zeroed_on_poison_heal() {
+        // Setup: side_one's active has Toxic, side_two's active has Poison Heal ability.
+        // status_threat_score should return 0 even though immune_to_status returns false.
+        use crate::choices::Choices;
+        use crate::state::PokemonStatus;
+        use super::Abilities;
+
+        let mut state = State::default();
+        let attacker = state.side_one.get_active();
+        attacker.moves.m0.id = Choices::TOXIC;
+        attacker.moves.m0.disabled = false;
+        attacker.moves.m0.pp = 10;
+        attacker.moves.m0.choice = crate::choices::MOVES.get(&Choices::TOXIC).unwrap().clone();
+        attacker.moves.m1.disabled = true;
+        attacker.moves.m2.disabled = true;
+        attacker.moves.m3.disabled = true;
+
+        // Defender: Gliscor-like (Ground/Flying so Toxic isn't already type-blocked) with Poison Heal.
+        let defender = state.side_two.get_active();
+        defender.types = (PokemonType::GROUND, PokemonType::FLYING);
+        defender.ability = Abilities::POISONHEAL;
+        defender.status = PokemonStatus::NONE;
+        defender.hp = defender.maxhp;
+
+        let score = super::status_threat_score(&state, &SideReference::SideOne);
+        assert_eq!(score, 0.0, "Toxic on Poison Heal target must score 0 status_threat");
+
+        // Negative control: same setup, defender ability flipped to a non-PoisonHeal ability.
+        // Toxic must score > 0 (Gliscor without PoisonHeal is still toxicable).
+        let defender = state.side_two.get_active();
+        defender.ability = Abilities::NONE;
+        let score_no_pheal = super::status_threat_score(&state, &SideReference::SideOne);
+        assert!(score_no_pheal > 0.0,
+                "Toxic on Ground/Flying without Poison Heal must score > 0 (got {})",
+                score_no_pheal);
     }
 }
