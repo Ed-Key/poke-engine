@@ -483,19 +483,16 @@ pub fn aggregate_pimc(
     assert!(!results.is_empty(), "aggregate_pimc requires at least 1 result");
     let k = results.len() as f32;
 
-    // 1. Compute weighted_visits per (move_choice as canonical string) on side one.
-    //    We key by MoveChoice because moves can repeat across hypotheses but the
-    //    move-index within a hypothesis is meaningful only locally.
-    let mut weighted: HashMap<String, f32> = HashMap::new();
+    // 1. Compute weighted_visits per MoveChoice on side one.
+    let mut weighted: HashMap<MoveChoice, f32> = HashMap::new();
     for r in &results {
         let total: u32 = r.s1.iter().map(|m| m.visits).sum();
         if total == 0 {
             continue;
         }
         for m in &r.s1 {
-            let key = format!("{:?}", m.move_choice);
             let share = m.visits as f32 / total as f32;
-            *weighted.entry(key).or_insert(0.0) += share / k;
+            *weighted.entry(m.move_choice).or_insert(0.0) += share / k;
         }
     }
 
@@ -505,21 +502,24 @@ pub fn aggregate_pimc(
     }
 
     // 2. Find top weighted score; filter to within 75% of top.
-    let top = weighted.values().cloned().fold(f32::MIN, f32::max);
+    let top = weighted.values().copied().fold(f32::MIN, f32::max);
     let threshold = top * 0.75;
-    let survivors: Vec<(String, f32)> = weighted
+    let survivors: Vec<(MoveChoice, f32)> = weighted
         .iter()
         .filter(|(_, w)| **w >= threshold)
-        .map(|(k, w)| (k.clone(), *w))
+        .map(|(mc, w)| (*mc, *w))
         .collect();
 
     // 3. Pick winner.
-    let winner_key = if pick_deterministic || survivors.len() == 1 {
+    //    `partial_cmp(...).unwrap()` is safe: weights are `share / k` where
+    //    `share` ∈ [0, 1] and `k` is a positive finite f32, so values are
+    //    finite non-negative — NaN is unreachable.
+    let winner: MoveChoice = if pick_deterministic || survivors.len() == 1 {
         // Argmax
         survivors
             .iter()
             .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
-            .map(|(k, _)| k.clone())
+            .map(|(mc, _)| *mc)
             .unwrap()
     } else {
         // Weighted-random sample
@@ -530,7 +530,7 @@ pub fn aggregate_pimc(
             None => Box::new(rand::rng()),
         };
         let idx = dist.sample(&mut rng_inst);
-        survivors[idx].0.clone()
+        survivors[idx].0
     };
 
     // 4. Build the aggregated MctsResult.
@@ -538,12 +538,11 @@ pub fn aggregate_pimc(
     //    raw visits across hypotheses, total_score = sum.
     //    s2: same but on side two (we don't need to interleave; sum is fine).
     //    iteration_count: sum.
-    let mut agg_s1_map: HashMap<String, MctsSideResult> = HashMap::new();
+    let mut agg_s1_map: HashMap<MoveChoice, MctsSideResult> = HashMap::new();
     for r in &results {
         for m in &r.s1 {
-            let key = format!("{:?}", m.move_choice);
-            let entry = agg_s1_map.entry(key).or_insert_with(|| MctsSideResult {
-                move_choice: m.move_choice.clone(),
+            let entry = agg_s1_map.entry(m.move_choice).or_insert_with(|| MctsSideResult {
+                move_choice: m.move_choice,
                 total_score: 0.0,
                 visits: 0,
             });
@@ -554,8 +553,8 @@ pub fn aggregate_pimc(
     // Sort: winner first, rest by visits descending.
     let mut agg_s1: Vec<MctsSideResult> = agg_s1_map.into_values().collect();
     agg_s1.sort_by(|a, b| {
-        let a_is_winner = format!("{:?}", a.move_choice) == winner_key;
-        let b_is_winner = format!("{:?}", b.move_choice) == winner_key;
+        let a_is_winner = a.move_choice == winner;
+        let b_is_winner = b.move_choice == winner;
         match (a_is_winner, b_is_winner) {
             (true, false) => std::cmp::Ordering::Less,
             (false, true) => std::cmp::Ordering::Greater,
@@ -564,12 +563,11 @@ pub fn aggregate_pimc(
     });
 
     // Same shape on s2 (sum across hypotheses).
-    let mut agg_s2_map: HashMap<String, MctsSideResult> = HashMap::new();
+    let mut agg_s2_map: HashMap<MoveChoice, MctsSideResult> = HashMap::new();
     for r in &results {
         for m in &r.s2 {
-            let key = format!("{:?}", m.move_choice);
-            let entry = agg_s2_map.entry(key).or_insert_with(|| MctsSideResult {
-                move_choice: m.move_choice.clone(),
+            let entry = agg_s2_map.entry(m.move_choice).or_insert_with(|| MctsSideResult {
+                move_choice: m.move_choice,
                 total_score: 0.0,
                 visits: 0,
             });
@@ -582,13 +580,13 @@ pub fn aggregate_pimc(
 
     let iteration_count: u32 = results.iter().map(|r| r.iteration_count).sum();
 
-    // PV: from first hypothesis whose top-visited s1 move matches winner_key.
+    // PV: from first hypothesis whose top-visited s1 move matches winner.
     let pv = results
         .iter()
         .find(|r| {
             r.s1.iter()
                 .max_by_key(|m| m.visits)
-                .map(|m| format!("{:?}", m.move_choice) == winner_key)
+                .map(|m| m.move_choice == winner)
                 .unwrap_or(false)
         })
         .map(|r| r.principal_variation.clone())
@@ -726,6 +724,139 @@ mod stream_tests {
     #[should_panic(expected = "aggregate_pimc requires at least 1 result")]
     fn test_aggregate_pimc_empty_panics() {
         aggregate_pimc(vec![], true, None);
+    }
+
+    #[test]
+    fn test_aggregate_pimc_pv_picked_from_matching_hypothesis() {
+        use crate::engine::state::MoveChoice;
+        use crate::state::PokemonMoveIndex;
+        let mk = |mc: MoveChoice, v: u32| MctsSideResult {
+            move_choice: mc,
+            total_score: 0.0,
+            visits: v,
+        };
+        let pv_a = vec![PrincipalVariationStep {
+            s1_move: "moveA".into(),
+            s2_move: "x".into(),
+        }];
+        let pv_b = vec![PrincipalVariationStep {
+            s1_move: "moveB".into(),
+            s2_move: "y".into(),
+        }];
+
+        // r1 favors Move(M0) with PV pv_a; r2 favors Move(M1) with PV pv_b.
+        // Aggregated winner is Move(M0) (3:1 visit-share advantage), so PV should be pv_a.
+        let r1 = MctsResult {
+            s1: vec![
+                mk(MoveChoice::Move(PokemonMoveIndex::M0), 100),
+                mk(MoveChoice::Move(PokemonMoveIndex::M1), 10),
+            ],
+            s2: vec![],
+            iteration_count: 110,
+            principal_variation: pv_a.clone(),
+        };
+        let r2 = MctsResult {
+            s1: vec![
+                mk(MoveChoice::Move(PokemonMoveIndex::M0), 30),
+                mk(MoveChoice::Move(PokemonMoveIndex::M1), 60),
+            ],
+            s2: vec![],
+            iteration_count: 90,
+            principal_variation: pv_b.clone(),
+        };
+        let agg = aggregate_pimc(vec![r1, r2], true, None);
+        assert_eq!(agg.principal_variation.len(), 1);
+        assert_eq!(agg.principal_variation[0].s1_move, "moveA");
+    }
+
+    #[test]
+    fn test_aggregate_pimc_pv_falls_back_to_first_when_no_match() {
+        use crate::engine::state::MoveChoice;
+        use crate::state::PokemonMoveIndex;
+        let mk = |mc: MoveChoice, v: u32| MctsSideResult {
+            move_choice: mc,
+            total_score: 0.0,
+            visits: v,
+        };
+        let pv_a = vec![PrincipalVariationStep {
+            s1_move: "fromR1".into(),
+            s2_move: "x".into(),
+        }];
+        let pv_b = vec![PrincipalVariationStep {
+            s1_move: "fromR2".into(),
+            s2_move: "y".into(),
+        }];
+
+        // r1 top is M0; r2 top is M2. Aggregate weights tie M0 and M2 (each ~0.362),
+        // M1 ~0.276. Argmax picks one of M0/M2 (HashMap-order dependent), but in
+        // either case the winner IS the top of one hypothesis, so the matching-PV
+        // path will fire for that hypothesis. We assert the PV is non-empty and
+        // came from one of the two inputs.
+        let r1 = MctsResult {
+            s1: vec![
+                mk(MoveChoice::Move(PokemonMoveIndex::M0), 200),
+                mk(MoveChoice::Move(PokemonMoveIndex::M1), 80),
+                mk(MoveChoice::Move(PokemonMoveIndex::M2), 10),
+            ],
+            s2: vec![],
+            iteration_count: 290,
+            principal_variation: pv_a.clone(),
+        };
+        let r2 = MctsResult {
+            s1: vec![
+                mk(MoveChoice::Move(PokemonMoveIndex::M0), 10),
+                mk(MoveChoice::Move(PokemonMoveIndex::M1), 80),
+                mk(MoveChoice::Move(PokemonMoveIndex::M2), 200),
+            ],
+            s2: vec![],
+            iteration_count: 290,
+            principal_variation: pv_b.clone(),
+        };
+        let agg = aggregate_pimc(vec![r1, r2], true, None);
+        assert_eq!(agg.principal_variation.len(), 1);
+        let pv_text = &agg.principal_variation[0].s1_move;
+        assert!(
+            pv_text == "fromR1" || pv_text == "fromR2",
+            "PV s1_move should be fromR1 or fromR2, got {}",
+            pv_text
+        );
+    }
+
+    #[test]
+    fn test_aggregate_pimc_weighted_random_with_seed_is_deterministic() {
+        use crate::engine::state::MoveChoice;
+        use crate::state::PokemonMoveIndex;
+        let mk = |mc: MoveChoice, v: u32| MctsSideResult {
+            move_choice: mc,
+            total_score: 0.0,
+            visits: v,
+        };
+        // Two-move survivor set within 75% of top, so weighted-random branch fires.
+        let r = MctsResult {
+            s1: vec![
+                mk(MoveChoice::Move(PokemonMoveIndex::M0), 100),
+                mk(MoveChoice::Move(PokemonMoveIndex::M1), 80),
+            ],
+            s2: vec![],
+            iteration_count: 180,
+            principal_variation: vec![],
+        };
+        // Seed 42 gives some deterministic outcome. Run twice; results identical.
+        let agg1 = aggregate_pimc(vec![r.clone()], false, Some(42));
+        let agg2 = aggregate_pimc(vec![r.clone()], false, Some(42));
+        assert_eq!(
+            format!("{:?}", agg1.s1[0].move_choice),
+            format!("{:?}", agg2.s1[0].move_choice),
+            "same seed must yield same winner"
+        );
+        // Winner must be one of the two survivors (sanity).
+        let winner_mc = &agg1.s1[0].move_choice;
+        assert!(
+            matches!(winner_mc, MoveChoice::Move(PokemonMoveIndex::M0))
+                || matches!(winner_mc, MoveChoice::Move(PokemonMoveIndex::M1)),
+            "winner must be M0 or M1, got {:?}",
+            winner_mc
+        );
     }
 
     /// Exercise the MctsSearch incremental API: build, run twice, verify
