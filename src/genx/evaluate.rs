@@ -359,15 +359,41 @@ pub(crate) fn status_threat_score(state: &State, side_ref: &SideReference) -> f3
     best
 }
 
+/// Returns 0.3 if `opp_active` has a hazard remover (Defog, Rapid Spin, Court Change)
+/// in its moveset, else 1.0. Used to scale hazard eval contributions in stalemate
+/// matchups where the opp can blow our hazards away.
+///
+/// Note: chaos priors may populate Defog speculatively for some opp mons. We accept
+/// the false-positive risk for v1; if A/B regresses we'll gate on `is_revealed`.
+pub(crate) fn hazard_value_factor(opp_active: &Pokemon) -> f32 {
+    use crate::choices::Choices;
+    for mv in opp_active.moves.into_iter() {
+        if mv.disabled || mv.pp <= 0 {
+            continue;
+        }
+        match mv.choice.move_id {
+            Choices::DEFOG | Choices::RAPIDSPIN | Choices::COURTCHANGE => return 0.3,
+            _ => {}
+        }
+    }
+    1.0
+}
+
 pub fn evaluate(state: &State) -> f32 {
     let mut score = 0.0;
+
+    // Fix C: scale each side's hazard contributions by THAT side's active's
+    // remover capacity. Hazards on side_one damage side_one's mons; side_one's
+    // active is the one that could Defog/Spin/CourtChange them away.
+    let s1_hazard_factor = hazard_value_factor(state.side_one.get_active_immutable());
+    let s2_hazard_factor = hazard_value_factor(state.side_two.get_active_immutable());
 
     let mut iter = state.side_one.pokemon.into_iter();
     let mut s1_used_tera = false;
     while let Some(pkmn) = iter.next() {
         if pkmn.hp > 0 {
             score += evaluate_pokemon(pkmn);
-            score += evaluate_hazards(pkmn, &state.side_one);
+            score += evaluate_hazards(pkmn, &state.side_one) * s1_hazard_factor;
             if iter.pokemon_index == state.side_one.active_index {
                 for vs in state.side_one.volatile_statuses.iter() {
                     match vs {
@@ -402,7 +428,7 @@ pub fn evaluate(state: &State) -> f32 {
     while let Some(pkmn) = iter.next() {
         if pkmn.hp > 0 {
             score -= evaluate_pokemon(pkmn);
-            score -= evaluate_hazards(pkmn, &state.side_two);
+            score -= evaluate_hazards(pkmn, &state.side_two) * s2_hazard_factor;
 
             if iter.pokemon_index == state.side_two.active_index {
                 for vs in state.side_two.volatile_statuses.iter() {
@@ -734,5 +760,52 @@ mod tests {
         assert!(without_item < with_item,
                 "Knock Off threat should be lower when defender has no item; got without={} >= with={}",
                 without_item, with_item);
+    }
+
+    #[test]
+    fn test_fixC_hazards_scaled_down_when_opp_has_defog() {
+        // Setup: side_one has Stealth Rock on side_two. Compute eval. Then add Defog
+        // to side_two's active. Eval should DROP for side_one (hazards now worth less).
+        use crate::choices::Choices;
+
+        let mut state = State::default();
+        state.side_two.side_conditions.stealth_rock = 1;
+
+        // Defender doesn't have Defog yet — give it Tackle.
+        let defender = state.side_two.get_active();
+        defender.moves.m0.id = Choices::TACKLE;
+        defender.moves.m0.disabled = false;
+        defender.moves.m0.pp = 16;
+        defender.moves.m0.choice = crate::choices::MOVES.get(&Choices::TACKLE).unwrap().clone();
+
+        let score_without_defog = super::evaluate(&state);
+
+        // Now defender DOES have Defog.
+        state.side_two.get_active().moves.m0.id = Choices::DEFOG;
+        state.side_two.get_active().moves.m0.choice = crate::choices::MOVES.get(&Choices::DEFOG).unwrap().clone();
+
+        let score_with_defog = super::evaluate(&state);
+
+        // Side_one's score should be lower with opp Defog (their SR is worth less to side_one).
+        assert!(score_with_defog < score_without_defog,
+                "score with opp Defog ({}) must be < score without ({})",
+                score_with_defog, score_without_defog);
+    }
+
+    #[test]
+    fn test_fixC_no_remover_keeps_hazards_full_value() {
+        // Sanity check: if opp has no remover, hazard scaling factor is 1.0 (no change).
+        let mut state = State::default();
+        state.side_one.side_conditions.spikes = 1;
+
+        let score_baseline = super::evaluate(&state);
+
+        // Verify factor returns 1.0 explicitly.
+        let factor = super::hazard_value_factor(state.side_one.get_active_immutable());
+        assert_eq!(factor, 1.0, "no remover → factor must be 1.0");
+
+        // Score is deterministic.
+        let score_again = super::evaluate(&state);
+        assert_eq!(score_baseline, score_again, "evaluate must be deterministic");
     }
 }
