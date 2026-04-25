@@ -58,6 +58,45 @@ struct ErrorResponse {
     error: String,
 }
 
+/// If the request body has a top-level "hypotheses" array, return the parsed
+/// list of per-hypothesis JSON strings; otherwise return None.
+///
+/// We keep each hypothesis as a String (rather than serde_json::Value) so the
+/// existing `auto_detect_and_parse(&str)` path stays unchanged.
+fn extract_hypotheses(body: &str) -> Option<Vec<String>> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    let arr = v.get("hypotheses")?.as_array()?;
+    if arr.is_empty() {
+        return None;
+    }
+    Some(arr.iter().map(|h| h.to_string()).collect())
+}
+
+/// Spawn one PIMC worker thread. Each parses its own hypothesis JSON and runs
+/// its own MctsSearch end-to-end. Returns a JoinHandle wrapping Result<MctsResult, String>.
+fn handles_spawn(
+    hypothesis_json: String,
+    budget_ms: u64,
+    _seed: u64,
+) -> std::thread::JoinHandle<Result<poke_engine::mcts::MctsResult, String>> {
+    use poke_engine::mcts::MctsSearch;
+    use poke_engine::translate::auto_detect_and_parse;
+    use std::time::{Duration, Instant};
+
+    std::thread::spawn(move || {
+        let state = auto_detect_and_parse(&hypothesis_json)
+            .map_err(|e| format!("State parse error: {}", e))?;
+        let (s1_options, s2_options) = state.root_get_all_options();
+        if s1_options.is_empty() {
+            return Err("No legal moves for side one".to_string());
+        }
+        let mut search = MctsSearch::new(state.clone(), s1_options, s2_options);
+        let start = Instant::now();
+        search.run_for(Duration::from_millis(budget_ms));
+        Ok(search.snapshot(start.elapsed().as_millis() as u64))
+    })
+}
+
 // Streaming NDJSON event emitted by /analyze/stream.
 // Field names MUST stay in sync with the Python EngineClient consumer at
 // /Users/edkiboma/Projects/showdown-copilot/src/showdown_copilot/engine_client.py
@@ -331,6 +370,62 @@ async fn analyze_stream_handler(body: String) -> impl IntoResponse {
             tx.blocking_send(line).is_ok()
         }
 
+        // Capture first hypothesis before consuming the vec, so we can resolve
+        // s1 move names for the response after aggregation.
+        let first_hyp_for_names = match extract_hypotheses(&raw_json) {
+            Some(hs) if !hs.is_empty() => hs[0].clone(),
+            _ => raw_json.clone(),  // unused in single-search path; harmless
+        };
+
+        // PIMC dispatch: if "hypotheses" is present, run K parallel searches,
+        // aggregate, emit one final event. Otherwise fall through to single-search.
+        if let Some(hypotheses) = extract_hypotheses(&raw_json) {
+            let k = hypotheses.len();
+            let per_hypothesis_budget = time_limit_ms / (k as u64).max(1);
+
+            // Spawn K worker threads; each owns one hypothesis end-to-end.
+            let mut handles = Vec::with_capacity(k);
+            for (i, hyp_json) in hypotheses.into_iter().enumerate() {
+                let h = handles_spawn(hyp_json, per_hypothesis_budget, i as u64);
+                handles.push(h);
+            }
+            // Join all. If any worker errored, abort PIMC and emit error.
+            let mut results = Vec::with_capacity(k);
+            for h in handles {
+                match h.join() {
+                    Ok(Ok(r)) => results.push(r),
+                    Ok(Err(msg)) => {
+                        let _ = emit(&tx, &error_stream_update(format!("PIMC worker error: {}", msg)));
+                        return;
+                    }
+                    Err(_) => {
+                        let _ = emit(&tx, &error_stream_update("PIMC worker panicked".to_string()));
+                        return;
+                    }
+                }
+            }
+            if results.is_empty() {
+                let _ = emit(&tx, &error_stream_update("PIMC produced no results".to_string()));
+                return;
+            }
+
+            // Aggregate.
+            let aggregated = poke_engine::mcts::aggregate_pimc(results, false, None);
+
+            // Synthesize the s1 move-name list from the FIRST hypothesis's state.
+            // (All K hypotheses share the same player-side team — only opp varies.)
+            let s1_names = match poke_engine::translate::auto_detect_and_parse(&first_hyp_for_names) {
+                Ok(state) => {
+                    let (s1_options, _) = state.root_get_all_options();
+                    s1_options.iter().map(|mc| mc.to_string(&state.side_one)).collect::<Vec<_>>()
+                }
+                Err(_) => Vec::new(),
+            };
+            let final_update = build_stream_update("final", &aggregated, &s1_names);
+            let _ = emit(&tx, &final_update);
+            return;
+        }
+
         // Parse the state. If parsing fails, emit a single error event and
         // return.
         let state = match auto_detect_and_parse(&raw_json) {
@@ -437,4 +532,30 @@ async fn main() {
     axum::serve(listener, app)
         .await
         .expect("Server error");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_hypotheses_present() {
+        let body = r#"{"hypotheses":[{"a":1},{"b":2}],"timeLimitMs":1000}"#;
+        let h = extract_hypotheses(body).expect("should detect hypotheses");
+        assert_eq!(h.len(), 2);
+        assert!(h[0].contains("\"a\""));
+        assert!(h[1].contains("\"b\""));
+    }
+
+    #[test]
+    fn test_extract_hypotheses_absent() {
+        let body = r#"{"sideOne":{},"timeLimitMs":1000}"#;
+        assert!(extract_hypotheses(body).is_none());
+    }
+
+    #[test]
+    fn test_extract_hypotheses_empty_array_returns_none() {
+        let body = r#"{"hypotheses":[]}"#;
+        assert!(extract_hypotheses(body).is_none());
+    }
 }
