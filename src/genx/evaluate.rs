@@ -206,8 +206,18 @@ pub(crate) fn threat_score(state: &State, side_ref: &SideReference) -> f32 {
         if let Some((normal, _crit)) =
             calculate_damage(state, side_ref, choice, DamageRolls::Average)
         {
-            if normal > best_damage {
-                best_damage = normal;
+            // Fix B Rule 4: Knock Off's 1.5x damage bonus only realizes when the
+            // defender currently holds an item. On an item-less target the
+            // "remove item" utility is already cashed, so scale the recommended
+            // damage down to discourage MCTS from over-spamming Knock Off.
+            let mut effective = normal;
+            if choice.move_id == crate::choices::Choices::KNOCKOFF
+                && defender.item == Items::NONE
+            {
+                effective = ((effective as f32) * 0.66) as i16;
+            }
+            if effective > best_damage {
+                best_damage = effective;
             }
         }
     }
@@ -692,5 +702,37 @@ mod tests {
         assert!(score_no_pheal > 0.0,
                 "Toxic on Ground/Flying without Poison Heal must score > 0 (got {})",
                 score_no_pheal);
+    }
+
+    #[test]
+    fn test_fixB_knock_off_no_bonus_on_itemless() {
+        // Setup: defender has an item, threat_score for Knock Off baseline.
+        // Then: defender.item = NONE, threat_score for same move should be lower
+        // (Knock Off's 1.5x damage bonus only applies on item-holding defenders).
+        use crate::choices::Choices;
+        use super::Items;
+
+        let mut state = State::default();
+        let attacker = state.side_one.get_active();
+        attacker.moves.m0.id = Choices::KNOCKOFF;
+        attacker.moves.m0.disabled = false;
+        attacker.moves.m0.pp = 16;
+        attacker.moves.m0.choice = crate::choices::MOVES.get(&Choices::KNOCKOFF).unwrap().clone();
+        attacker.moves.m1.disabled = true;
+        attacker.moves.m2.disabled = true;
+        attacker.moves.m3.disabled = true;
+
+        // Defender with item.
+        let defender = state.side_two.get_active();
+        defender.item = Items::LEFTOVERS;
+        let with_item = super::threat_score(&state, &SideReference::SideOne);
+
+        // Defender without item.
+        state.side_two.get_active().item = Items::NONE;
+        let without_item = super::threat_score(&state, &SideReference::SideOne);
+
+        assert!(without_item < with_item,
+                "Knock Off threat should be lower when defender has no item; got without={} >= with={}",
+                without_item, with_item);
     }
 }
