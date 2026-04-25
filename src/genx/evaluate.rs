@@ -289,6 +289,13 @@ pub(crate) fn status_threat_score(state: &State, side_ref: &SideReference) -> f3
         if choice.category != MoveCategory::Status {
             continue;
         }
+        // Fix B Rule 2: powder moves are blocked by Grass type or Overcoat ability.
+        if choice.flags.powder
+            && (defender.has_type(&PokemonType::GRASS)
+                || defender.ability == Abilities::OVERCOAT)
+        {
+            continue;
+        }
         let accuracy = (choice.accuracy / 100.0).min(1.0);
 
         // Primary status (Sleep Powder, Thunder Wave, Will-O-Wisp, Toxic, ...).
@@ -603,5 +610,40 @@ mod tests {
         assert!(score_no_terrain > 0.0,
                 "without Psychic Terrain, Sucker Punch must score > 0 (got {})",
                 score_no_terrain);
+    }
+
+    #[test]
+    fn test_fixB_powder_zeroed_on_grass_type() {
+        // Setup: side_one's active has Sleep Powder, side_two's active is Grass type.
+        // status_threat_score should return 0 (powder doesn't affect Grass).
+        use crate::choices::Choices;
+        use crate::state::PokemonStatus;
+
+        let mut state = State::default();
+        let attacker = state.side_one.get_active();
+        attacker.moves.m0.id = Choices::SLEEPPOWDER;
+        attacker.moves.m0.disabled = false;
+        attacker.moves.m0.pp = 16;
+        attacker.moves.m0.choice = crate::choices::MOVES.get(&Choices::SLEEPPOWDER).unwrap().clone();
+        attacker.moves.m1.disabled = true;
+        attacker.moves.m2.disabled = true;
+        attacker.moves.m3.disabled = true;
+
+        // Force defender to Grass type.
+        let defender = state.side_two.get_active();
+        defender.types = (PokemonType::GRASS, PokemonType::TYPELESS);
+        defender.status = PokemonStatus::NONE;
+        defender.hp = defender.maxhp;
+
+        let score = super::status_threat_score(&state, &SideReference::SideOne);
+        assert_eq!(score, 0.0, "powder move on Grass type must score 0 status_threat");
+
+        // Negative control: flip defender off Grass — same Sleep Powder must now score > 0.
+        let defender = state.side_two.get_active();
+        defender.types = (PokemonType::NORMAL, PokemonType::TYPELESS);
+        let score_normal = super::status_threat_score(&state, &SideReference::SideOne);
+        assert!(score_normal > 0.0,
+                "Sleep Powder on Normal-type must score > 0 (got {})",
+                score_normal);
     }
 }
