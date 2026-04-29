@@ -1,0 +1,636 @@
+{
+  "sideOne": {
+    "activeIndex": 0,
+    "boosts": {},
+    "pokemon": [
+      {
+        "ability": "roughskin",
+        "attack": 359,
+        "boosts": {},
+        "defense": 246,
+        "evs": {
+          "atk": 0,
+          "def": 0,
+          "hp": 0,
+          "spa": 0,
+          "spd": 0,
+          "spe": 0
+        },
+        "hp": 357,
+        "item": "loadeddice",
+        "level": 100,
+        "maxhp": 357,
+        "moves": [
+          {
+            "id": "earthquake",
+            "pp": 16
+          },
+          {
+            "id": "scaleshot",
+            "pp": 16
+          },
+          {
+            "id": "stealthrock",
+            "pp": 16
+          },
+          {
+            "id": "spikes",
+            "pp": 16
+          }
+        ],
+        "nature": "serious",
+        "restTurns": 0,
+        "sleepTurns": 0,
+        "specialAttack": 207,
+        "specialDefense": 226,
+        "species": "garchomp",
+        "speed": 261,
+        "status": "None",
+        "teraType": "ground",
+        "terastallized": false,
+        "types": [
+          "dragon",
+          "ground"
+        ],
+        "weightKg": 100.0
+      },
+      {
+        "ability": "psychicsurge",
+        "attack": 207,
+        "boosts": {},
+        "defense": 196,
+        "evs": {
+          "atk": 0,
+          "def": 0,
+          "hp": 0,
+          "spa": 0,
+          "spd": 0,
+          "spe": 0
+        },
+        "hp": 281,
+        "item": "choicespecs",
+        "level": 100,
+        "maxhp": 281,
+        "moves": [
+          {
+            "id": "psychic",
+            "pp": 16
+          },
+          {
+            "id": "moonblast",
+            "pp": 16
+          },
+          {
+            "id": "focusblast",
+            "pp": 16
+          },
+          {
+            "id": "psyshock",
+            "pp": 16
+          }
+        ],
+        "nature": "serious",
+        "restTurns": 0,
+        "sleepTurns": 0,
+        "specialAttack": 333,
+        "specialDefense": 287,
+        "species": "tapulele",
+        "speed": 251,
+        "status": "None",
+        "teraType": "fairy",
+        "terastallized": false,
+        "types": [
+          "fairy",
+          "psychic"
+        ],
+        "weightKg": 100.0
+      },
+      {
+        "ability": "unseenfist",
+        "attack": 359,
+        "boosts": {},
+        "defense": 246,
+        "evs": {
+          "atk": 0,
+          "def": 0,
+          "hp": 0,
+          "spa": 0,
+          "spd": 0,
+          "spe": 0
+        },
+        "hp": 341,
+        "item": "choiceband",
+        "level": 100,
+        "maxhp": 341,
+        "moves": [
+          {
+            "id": "surgingstrikes",
+            "pp": 16
+          },
+          {
+            "id": "closecombat",
+            "pp": 16
+          },
+          {
+            "id": "uturn",
+            "pp": 16
+          },
+          {
+            "id": "aquajet",
+            "pp": 16
+          }
+        ],
+        "nature": "serious",
+        "restTurns": 0,
+        "sleepTurns": 0,
+        "specialAttack": 167,
+        "specialDefense": 161,
+        "species": "urshifurapidstrike",
+        "speed": 243,
+        "status": "None",
+        "teraType": "water",
+        "terastallized": false,
+        "types": [
+          "fighting",
+          "water"
+        ],
+        "weightKg": 100.0
+      },
+      {
+        "ability": "ironfist",
+        "attack": 383,
+        "boosts": {},
+        "defense": 322,
+        "evs": {
+          "atk": 0,
+          "def": 0,
+          "hp": 0,
+          "spa": 0,
+          "spd": 0,
+          "spe": 0
+        },
+        "hp": 415,
+        "item": "assaultvest",
+        "level": 100,
+        "maxhp": 415,
+        "moves": [
+          {
+            "id": "doubleironbash",
+            "pp": 16
+          },
+          {
+            "id": "earthquake",
+            "pp": 16
+          },
+          {
+            "id": "icepunch",
+            "pp": 16
+          },
+          {
+            "id": "thunderpunch",
+            "pp": 16
+          }
+        ],
+        "nature": "serious",
+        "restTurns": 0,
+        "sleepTurns": 0,
+        "specialAttack": 196,
+        "specialDefense": 167,
+        "species": "melmetal",
+        "speed": 105,
+        "status": "None",
+        "teraType": "steel",
+        "terastallized": false,
+        "types": [
+          "steel"
+        ],
+        "weightKg": 100.0
+      },
+      {
+        "ability": "static",
+        "attack": 226,
+        "boosts": {},
+        "defense": 217,
+        "evs": {
+          "atk": 0,
+          "def": 0,
+          "hp": 0,
+          "spa": 0,
+          "spd": 0,
+          "spe": 0
+        },
+        "hp": 321,
+        "item": "heavydutyboots",
+        "level": 100,
+        "maxhp": 321,
+        "moves": [
+          {
+            "id": "hurricane",
+            "pp": 16
+          },
+          {
+            "id": "discharge",
+            "pp": 16
+          },
+          {
+            "id": "roost",
+            "pp": 16
+          },
+          {
+            "id": "defog",
+            "pp": 16
+          }
+        ],
+        "nature": "serious",
+        "restTurns": 0,
+        "sleepTurns": 0,
+        "specialAttack": 322,
+        "specialDefense": 226,
+        "species": "zapdos",
+        "speed": 246,
+        "status": "None",
+        "teraType": "flying",
+        "terastallized": false,
+        "types": [
+          "electric",
+          "flying"
+        ],
+        "weightKg": 100.0
+      },
+      {
+        "ability": "ironbarbs",
+        "attack": 230,
+        "boosts": {},
+        "defense": 308,
+        "evs": {
+          "atk": 0,
+          "def": 0,
+          "hp": 0,
+          "spa": 0,
+          "spd": 0,
+          "spe": 0
+        },
+        "hp": 290,
+        "item": "leftovers",
+        "level": 100,
+        "maxhp": 290,
+        "moves": [
+          {
+            "id": "leechseed",
+            "pp": 16
+          },
+          {
+            "id": "powerwhip",
+            "pp": 16
+          },
+          {
+            "id": "knockoff",
+            "pp": 16
+          },
+          {
+            "id": "spikes",
+            "pp": 16
+          }
+        ],
+        "nature": "serious",
+        "restTurns": 0,
+        "sleepTurns": 0,
+        "specialAttack": 158,
+        "specialDefense": 280,
+        "species": "ferrothorn",
+        "speed": 78,
+        "status": "None",
+        "teraType": "grass",
+        "terastallized": false,
+        "types": [
+          "grass",
+          "steel"
+        ],
+        "weightKg": 100.0
+      }
+    ],
+    "sideConditions": {}
+  },
+  "sideTwo": {
+    "activeIndex": 0,
+    "boosts": {},
+    "pokemon": [
+      {
+        "ability": "quarkdrive",
+        "attack": 188,
+        "boosts": {
+          "special-attack": 2,
+          "special-defense": 2
+        },
+        "defense": 236,
+        "evs": {
+          "atk": 0,
+          "def": 0,
+          "hp": 0,
+          "spa": 0,
+          "spd": 0,
+          "spe": 0
+        },
+        "hp": 321,
+        "item": "boosterenergy",
+        "level": 100,
+        "maxhp": 321,
+        "moves": [
+          {
+            "id": "calmmind",
+            "pp": 16
+          },
+          {
+            "id": "none",
+            "pp": 0
+          },
+          {
+            "id": "none",
+            "pp": 0
+          },
+          {
+            "id": "none",
+            "pp": 0
+          }
+        ],
+        "nature": "serious",
+        "restTurns": 0,
+        "sleepTurns": 0,
+        "specialAttack": 320,
+        "specialDefense": 290,
+        "species": "ironcrown",
+        "speed": 252,
+        "status": "None",
+        "teraType": "psychic",
+        "terastallized": false,
+        "types": [
+          "psychic",
+          "steel"
+        ],
+        "weightKg": 100.0
+      },
+      {
+        "ability": "none",
+        "attack": 161,
+        "boosts": {},
+        "defense": 287,
+        "evs": {
+          "atk": 0,
+          "def": 0,
+          "hp": 0,
+          "spa": 0,
+          "spd": 0,
+          "spe": 0
+        },
+        "hp": 283,
+        "item": "none",
+        "level": 100,
+        "maxhp": 283,
+        "moves": [
+          {
+            "id": "matchagotcha",
+            "pp": 16
+          },
+          {
+            "id": "none",
+            "pp": 0
+          },
+          {
+            "id": "none",
+            "pp": 0
+          },
+          {
+            "id": "none",
+            "pp": 0
+          }
+        ],
+        "nature": "serious",
+        "restTurns": 0,
+        "sleepTurns": 0,
+        "specialAttack": 327,
+        "specialDefense": 226,
+        "species": "sinistchamasterpiece",
+        "speed": 196,
+        "status": "None",
+        "teraType": "",
+        "terastallized": false,
+        "types": [
+          "ghost",
+          "grass"
+        ],
+        "weightKg": 100.0
+      },
+      {
+        "ability": "none",
+        "attack": 339,
+        "boosts": {},
+        "defense": 158,
+        "evs": {
+          "atk": 0,
+          "def": 0,
+          "hp": 0,
+          "spa": 0,
+          "spd": 0,
+          "spe": 0
+        },
+        "hp": 241,
+        "item": "none",
+        "level": 100,
+        "maxhp": 241,
+        "moves": [
+          {
+            "id": "focusblast",
+            "pp": 16
+          },
+          {
+            "id": "none",
+            "pp": 0
+          },
+          {
+            "id": "none",
+            "pp": 0
+          },
+          {
+            "id": "none",
+            "pp": 0
+          }
+        ],
+        "nature": "serious",
+        "restTurns": 0,
+        "sleepTurns": 0,
+        "specialAttack": 125,
+        "specialDefense": 320,
+        "species": "hitmonlee",
+        "speed": 230,
+        "status": "None",
+        "teraType": "",
+        "terastallized": false,
+        "types": [
+          "fighting"
+        ],
+        "weightKg": 100.0
+      },
+      {
+        "ability": "none",
+        "attack": 184,
+        "boosts": {},
+        "defense": 384,
+        "evs": {
+          "atk": 0,
+          "def": 0,
+          "hp": 0,
+          "spa": 0,
+          "spd": 0,
+          "spe": 0
+        },
+        "hp": 241,
+        "item": "none",
+        "level": 100,
+        "maxhp": 241,
+        "moves": [
+          {
+            "id": "none",
+            "pp": 0
+          },
+          {
+            "id": "none",
+            "pp": 0
+          },
+          {
+            "id": "none",
+            "pp": 0
+          },
+          {
+            "id": "none",
+            "pp": 0
+          }
+        ],
+        "nature": "serious",
+        "restTurns": 0,
+        "sleepTurns": 0,
+        "specialAttack": 167,
+        "specialDefense": 366,
+        "species": "toxapex",
+        "speed": 105,
+        "status": "None",
+        "teraType": "",
+        "terastallized": false,
+        "types": [
+          "poison",
+          "water"
+        ],
+        "weightKg": 100.0
+      },
+      {
+        "ability": "none",
+        "attack": 207,
+        "boosts": {},
+        "defense": 287,
+        "evs": {
+          "atk": 0,
+          "def": 0,
+          "hp": 0,
+          "spa": 0,
+          "spd": 0,
+          "spe": 0
+        },
+        "hp": 311,
+        "item": "none",
+        "level": 100,
+        "maxhp": 311,
+        "moves": [
+          {
+            "id": "stealthrock",
+            "pp": 16
+          },
+          {
+            "id": "none",
+            "pp": 0
+          },
+          {
+            "id": "none",
+            "pp": 0
+          },
+          {
+            "id": "none",
+            "pp": 0
+          }
+        ],
+        "nature": "serious",
+        "restTurns": 0,
+        "sleepTurns": 0,
+        "specialAttack": 261,
+        "specialDefense": 207,
+        "species": "palossand",
+        "speed": 105,
+        "status": "None",
+        "teraType": "",
+        "terastallized": false,
+        "types": [
+          "ghost",
+          "ground"
+        ],
+        "weightKg": 100.0
+      },
+      {
+        "ability": "none",
+        "attack": 226,
+        "boosts": {},
+        "defense": 271,
+        "evs": {
+          "atk": 0,
+          "def": 0,
+          "hp": 0,
+          "spa": 0,
+          "spd": 0,
+          "spe": 0
+        },
+        "hp": 311,
+        "item": "none",
+        "level": 100,
+        "maxhp": 311,
+        "moves": [
+          {
+            "id": "ruination",
+            "pp": 16
+          },
+          {
+            "id": "leechseed",
+            "pp": 16
+          },
+          {
+            "id": "none",
+            "pp": 0
+          },
+          {
+            "id": "none",
+            "pp": 0
+          }
+        ],
+        "nature": "serious",
+        "restTurns": 0,
+        "sleepTurns": 0,
+        "specialAttack": 251,
+        "specialDefense": 351,
+        "species": "wochien",
+        "speed": 196,
+        "status": "None",
+        "teraType": "",
+        "terastallized": false,
+        "types": [
+          "dark",
+          "grass"
+        ],
+        "weightKg": 100.0
+      }
+    ],
+    "sideConditions": {}
+  },
+  "terrain": {
+    "terrainType": "none"
+  },
+  "trickRoom": false,
+  "weather": {
+    "weatherType": "none"
+  }
+}
