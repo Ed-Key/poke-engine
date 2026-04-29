@@ -16,9 +16,12 @@ pub mod engine;
 pub mod engine;
 
 pub mod choices;
+pub mod eval_kind;
 pub mod instruction;
 pub mod io;
 pub mod mcts;
+pub mod nn_client;
+pub mod nn_state_encoder;
 pub mod pokemon;
 pub mod search;
 pub mod state;
