@@ -1,15 +1,18 @@
 use axum::{
     body::Body,
-    extract::Json,
+    extract::{Json, State as AxumState},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
     Router,
 };
 use clap::Parser;
-use poke_engine::mcts::{perform_mcts, MctsResult, MctsSearch};
+use poke_engine::eval_kind::EvalKind;
+use poke_engine::mcts::{MctsResult, MctsSearch};
+use poke_engine::nn_client::NnClient;
 use poke_engine::translate::auto_detect_and_parse;
 use serde::Serialize;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tower_http::cors::{Any, CorsLayer};
 
@@ -50,6 +53,16 @@ pub struct Cli {
 
     /// PUCT exploration constant. AlphaZero default is 1.25.
     #[arg(long, env = "POKE_ENGINE_C_PUCT", default_value_t = 1.25)]
+    pub c_puct: f32,
+}
+
+/// Shared per-process state plumbed through axum handlers.
+///
+/// Cheap to clone (Arc-wrapped client). Created once at startup; passed by
+/// value into the Router via `with_state`.
+#[derive(Clone)]
+pub struct AppState {
+    pub eval_kind: EvalKind,
     pub c_puct: f32,
 }
 
@@ -111,13 +124,20 @@ fn extract_hypotheses(body: &str) -> Option<Vec<String>> {
 
 /// Spawn one PIMC worker thread. Each parses its own hypothesis JSON and runs
 /// its own MctsSearch end-to-end. Returns a JoinHandle wrapping Result<MctsResult, String>.
+///
+/// Plan E: each worker calls the NN sidecar at the root for ITS hypothesis,
+/// using the shared `eval_kind`. This is per the verifier's R-MISSING-1 note:
+/// PIMC × NN serializes through the sidecar's GIL anyway, so K parallel
+/// workers each issuing one /policy call is fine for K up to ~8 — the wall
+/// clock is K × ~19ms inside the sidecar, parallelizable as far as the GIL
+/// allows.
 fn handles_spawn(
     hypothesis_json: String,
     budget_ms: u64,
     _seed: u64,
+    eval_kind: EvalKind,
+    c_puct: f32,
 ) -> std::thread::JoinHandle<Result<poke_engine::mcts::MctsResult, String>> {
-    use poke_engine::mcts::MctsSearch;
-    use poke_engine::translate::auto_detect_and_parse;
     use std::time::{Duration, Instant};
 
     std::thread::spawn(move || {
@@ -127,7 +147,13 @@ fn handles_spawn(
         if s1_options.is_empty() {
             return Err("No legal moves for side one".to_string());
         }
-        let mut search = MctsSearch::new(state.clone(), s1_options, s2_options);
+        let mut search = MctsSearch::new_with_eval(
+            state.clone(),
+            s1_options,
+            s2_options,
+            &eval_kind,
+            c_puct,
+        );
         let start = Instant::now();
         search.run_for(Duration::from_millis(budget_ms));
         Ok(search.snapshot(start.elapsed().as_millis() as u64))
@@ -162,6 +188,7 @@ async fn status_handler() -> Json<StatusResponse> {
 }
 
 async fn analyze_handler(
+    AxumState(app): AxumState<AppState>,
     body: String,
 ) -> Result<Json<AnalyzeResponse>, (StatusCode, Json<ErrorResponse>)> {
     // Extract timeLimit if present in the JSON
@@ -171,11 +198,15 @@ async fn analyze_handler(
         .unwrap_or(DEFAULT_TIME_LIMIT_MS);
 
     let raw_json = body;
+    let eval_kind = app.eval_kind.clone();
+    let c_puct = app.c_puct;
 
-    // Translate to poke-engine State — catch panics from deserialization
+    // Translate to poke-engine State — catch panics from deserialization.
+    // NN client calls happen inside this spawn_blocking thread, NEVER from
+    // the surrounding async context (would stall the executor).
     let result = tokio::task::spawn_blocking(move || {
         // Translate JSON -> State (auto-detects format)
-        let mut state = auto_detect_and_parse(&raw_json)
+        let state = auto_detect_and_parse(&raw_json)
             .map_err(|e| format!("State parse error: {}", e))?;
 
         // Get legal options (root includes tera/mega)
@@ -186,20 +217,22 @@ async fn analyze_handler(
         }
 
         // Snapshot side_one for move name resolution
-        let side_one_ref = &state.side_one;
         let s1_move_names: Vec<String> = s1_options
             .iter()
-            .map(|mc| mc.to_string(side_one_ref))
+            .map(|mc| mc.to_string(&state.side_one))
             .collect();
 
-        // Run MCTS
+        // Run MCTS via the Plan E entry point (handles NN dispatch + PUCT).
         let start = Instant::now();
-        let mcts_result = perform_mcts(
-            &mut state,
+        let mut search = MctsSearch::new_with_eval(
+            state,
             s1_options,
             s2_options,
-            Duration::from_millis(time_limit_ms),
+            &eval_kind,
+            c_puct,
         );
+        search.run_for(Duration::from_millis(time_limit_ms));
+        let mcts_result = search.snapshot(start.elapsed().as_millis() as u64);
         let elapsed_ms = start.elapsed().as_millis() as u64;
 
         // Process side-one results: pair with move names, sort by visits descending
@@ -365,7 +398,10 @@ fn error_stream_update(msg: String) -> StreamUpdate {
     }
 }
 
-async fn analyze_stream_handler(body: String) -> impl IntoResponse {
+async fn analyze_stream_handler(
+    AxumState(app): AxumState<AppState>,
+    body: String,
+) -> impl IntoResponse {
     // Parse out optional timing overrides from the request body. Defaults
     // are 5000ms for the time limit and 250ms for the update interval.
     // NOTE: this endpoint uses `timeLimitMs` / `updateIntervalMs` to match
@@ -382,6 +418,8 @@ async fn analyze_stream_handler(body: String) -> impl IntoResponse {
         .unwrap_or(DEFAULT_UPDATE_INTERVAL_MS);
 
     let raw_json = body;
+    let eval_kind = app.eval_kind.clone();
+    let c_puct = app.c_puct;
 
     // Channel between the blocking search thread and the async streaming
     // response body. Buffer 32 is enough for ~30s of updates at 1 Hz.
@@ -391,6 +429,10 @@ async fn analyze_stream_handler(body: String) -> impl IntoResponse {
     // !Send, so we cannot use tokio::task::spawn_blocking (which schedules
     // onto a Send-requiring pool). std::thread::spawn gives us a pinned
     // thread that owns the search for its entire lifetime.
+    //
+    // NN client calls (when --nn-eval is on) happen INSIDE this thread
+    // through MctsSearch::new_with_eval. Never call the NN client from the
+    // surrounding async context.
     std::thread::spawn(move || {
         // Helper: serialize a StreamUpdate as a single NDJSON line and push
         // to the channel. Returns false if the receiver has been dropped
@@ -423,7 +465,13 @@ async fn analyze_stream_handler(body: String) -> impl IntoResponse {
             // Spawn K worker threads; each owns one hypothesis end-to-end.
             let mut handles = Vec::with_capacity(k);
             for (i, hyp_json) in hypotheses.into_iter().enumerate() {
-                let h = handles_spawn(hyp_json, per_hypothesis_budget, i as u64);
+                let h = handles_spawn(
+                    hyp_json,
+                    per_hypothesis_budget,
+                    i as u64,
+                    eval_kind.clone(),
+                    c_puct,
+                );
                 handles.push(h);
             }
             // Join all. If any worker errored, abort PIMC and emit error.
@@ -491,7 +539,13 @@ async fn analyze_stream_handler(body: String) -> impl IntoResponse {
 
         // MctsSearch owns the State. Cloning is cheap relative to a
         // multi-second MCTS run.
-        let mut search = MctsSearch::new(state.clone(), s1_options, s2_options);
+        let mut search = MctsSearch::new_with_eval(
+            state.clone(),
+            s1_options,
+            s2_options,
+            &eval_kind,
+            c_puct,
+        );
         let start = Instant::now();
         let time_limit = Duration::from_millis(time_limit_ms);
         let interval = Duration::from_millis(update_interval_ms);
@@ -546,19 +600,40 @@ async fn main() {
 
     let cli = Cli::parse();
 
-    if cli.nn_eval {
+    let eval_kind = if cli.nn_eval {
+        let client = NnClient::new(
+            cli.nn_url.clone(),
+            Duration::from_millis(cli.nn_timeout_ms),
+        );
+        // Best-effort health check; do NOT fail-loudly here — engine should
+        // run even if sidecar isn't up yet (per-request fallback covers it).
+        match client.healthz() {
+            Ok(()) => log::info!("sidecar /healthz OK at {}", cli.nn_url),
+            Err(e) => log::warn!(
+                "sidecar /healthz FAILED at {}: {} — engine will still run, requests will fall back to heuristic",
+                cli.nn_url,
+                e
+            ),
+        }
         log::info!(
             "Plan E NN-prior mode ENABLED: nn_url={} nn_timeout_ms={} c_puct={}",
             cli.nn_url,
             cli.nn_timeout_ms,
             cli.c_puct,
         );
+        EvalKind::Nn(Arc::new(client))
     } else {
         log::info!(
             "Heuristic-only mode (Plan E flags inert): c_puct={}",
             cli.c_puct
         );
-    }
+        EvalKind::Heuristic
+    };
+
+    let app_state = AppState {
+        eval_kind,
+        c_puct: cli.c_puct,
+    };
 
     // Permissive CORS: server is localhost-only, no security concern.
     // Needed so browser extensions / userscripts / dev tools can fetch directly.
@@ -571,7 +646,8 @@ async fn main() {
         .route("/status", get(status_handler))
         .route("/analyze", post(analyze_handler))
         .route("/analyze/stream", post(analyze_stream_handler))
-        .layer(cors);
+        .layer(cors)
+        .with_state(app_state);
 
     let addr = format!("0.0.0.0:{}", cli.port);
     println!("poke-engine MCTS server starting on {}", addr);

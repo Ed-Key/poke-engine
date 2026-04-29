@@ -1,7 +1,10 @@
 use crate::engine::evaluate::evaluate;
 use crate::engine::generate_instructions::generate_instructions_from_move_pair;
 use crate::engine::state::MoveChoice;
+use crate::eval_kind::EvalKind;
 use crate::instruction::StateInstructions;
+use crate::nn_client::Perspective;
+use crate::nn_state_encoder::{encode, map_policy_to_options, SidePerspective};
 use crate::state::State;
 use rand::distr::weighted::WeightedIndex;
 use rand::prelude::*;
@@ -391,6 +394,55 @@ impl MctsSearch {
         s2_options: Vec<MoveChoice>,
     ) -> Self {
         Self::new_with_priors(state, s1_options, s2_options, DEFAULT_C_PUCT, None, None)
+    }
+
+    /// Plan E entry point: build a search with an explicit `EvalKind` +
+    /// `c_puct`. When `eval_kind` is `Nn(...)`, this calls the sidecar ONCE
+    /// at the root to derive the s1 prior. On any sidecar failure, logs a
+    /// warning and falls back to uniform priors (heuristic baseline).
+    ///
+    /// `s2_priors` are uniform in NN mode — Kakuna is one-sided; we don't
+    /// model the opponent's policy.
+    pub fn new_with_eval(
+        state: State,
+        s1_options: Vec<MoveChoice>,
+        s2_options: Vec<MoveChoice>,
+        eval_kind: &EvalKind,
+        c_puct: f32,
+    ) -> Self {
+        let s1_priors = match eval_kind {
+            EvalKind::Heuristic => None,
+            EvalKind::Nn(client) => {
+                let json = encode(&state, SidePerspective::Side1);
+                match client.policy(&json, Perspective::P1) {
+                    Ok(resp) => {
+                        let priors = map_policy_to_options(
+                            &resp.probs,
+                            &state,
+                            SidePerspective::Side1,
+                            &s1_options,
+                        );
+                        log::info!(
+                            "NN prior obtained at root: top mass={:?} (s1_options.len={})",
+                            priors
+                                .iter()
+                                .copied()
+                                .fold(f32::MIN, f32::max),
+                            s1_options.len(),
+                        );
+                        Some(priors)
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "NN client failed at root: {} — falling back to uniform priors",
+                            e
+                        );
+                        None
+                    }
+                }
+            }
+        };
+        Self::new_with_priors(state, s1_options, s2_options, c_puct, s1_priors, None)
     }
 
     /// Plan E variant of `new` that takes optional priors and a custom
