@@ -46,21 +46,38 @@ impl Node {
             s2_options: None,
         }
     }
-    unsafe fn populate(&mut self, s1_options: Vec<MoveChoice>, s2_options: Vec<MoveChoice>) {
+    unsafe fn populate(
+        &mut self,
+        s1_options: Vec<MoveChoice>,
+        s2_options: Vec<MoveChoice>,
+        s1_priors: Option<&[f32]>,
+        s2_priors: Option<&[f32]>,
+    ) {
+        let n1 = s1_options.len();
+        let n2 = s2_options.len();
+        let uniform1 = if n1 > 0 { 1.0 / n1 as f32 } else { 0.0 };
+        let uniform2 = if n2 > 0 { 1.0 / n2 as f32 } else { 0.0 };
+        let p1 = s1_priors;
+        let p2 = s2_priors;
+
         let s1_options_vec: Vec<MoveNode> = s1_options
             .iter()
-            .map(|x| MoveNode {
+            .enumerate()
+            .map(|(i, x)| MoveNode {
                 move_choice: x.clone(),
                 total_score: 0.0,
                 visits: 0,
+                prior: p1.and_then(|v| v.get(i).copied()).unwrap_or(uniform1),
             })
             .collect();
         let s2_options_vec: Vec<MoveNode> = s2_options
             .iter()
-            .map(|x| MoveNode {
+            .enumerate()
+            .map(|(i, x)| MoveNode {
                 move_choice: x.clone(),
                 total_score: 0.0,
                 visits: 0,
+                prior: p2.and_then(|v| v.get(i).copied()).unwrap_or(uniform2),
             })
             .collect();
 
@@ -68,35 +85,37 @@ impl Node {
         self.s2_options = Some(s2_options_vec);
     }
 
-    pub fn maximize_ucb_for_side(&self, side_map: &[MoveNode]) -> usize {
+    pub fn maximize_puct_for_side(&self, side_map: &[MoveNode], c_puct: f32) -> usize {
         let mut choice = 0;
-        let mut best_ucb1 = f32::MIN;
+        let mut best_score = f32::MIN;
         for (index, node) in side_map.iter().enumerate() {
-            let this_ucb1 = node.ucb1(self.times_visited);
-            if this_ucb1 > best_ucb1 {
-                best_ucb1 = this_ucb1;
+            let this_score = node.puct(self.times_visited, c_puct);
+            if this_score > best_score {
+                best_score = this_score;
                 choice = index;
             }
         }
         choice
     }
 
-    pub unsafe fn selection(&mut self, state: &mut State) -> (*mut Node, usize, usize) {
+    pub unsafe fn selection(&mut self, state: &mut State, c_puct: f32) -> (*mut Node, usize, usize) {
         let return_node = self as *mut Node;
         if self.s1_options.is_none() {
             let (s1_options, s2_options) = state.get_all_options();
-            self.populate(s1_options, s2_options);
+            // Non-root selection: uniform priors. Root NN priors are populated
+            // by `MctsSearch::new` via `Node::populate_with_priors`.
+            self.populate(s1_options, s2_options, None, None);
         }
 
-        let s1_mc_index = self.maximize_ucb_for_side(&self.s1_options.as_ref().unwrap());
-        let s2_mc_index = self.maximize_ucb_for_side(&self.s2_options.as_ref().unwrap());
+        let s1_mc_index = self.maximize_puct_for_side(&self.s1_options.as_ref().unwrap(), c_puct);
+        let s2_mc_index = self.maximize_puct_for_side(&self.s2_options.as_ref().unwrap(), c_puct);
         let child_vector = self.children.get_mut(&(s1_mc_index, s2_mc_index));
         match child_vector {
             Some(child_vector) => {
                 let child_vec_ptr = child_vector as *mut Vec<Node>;
                 let chosen_child = self.sample_node(child_vec_ptr);
                 state.apply_instructions(&(*chosen_child).instructions.instruction_list);
-                (*chosen_child).selection(state)
+                (*chosen_child).selection(state, c_puct)
             }
             None => (return_node, s1_mc_index, s2_mc_index),
         }
@@ -191,16 +210,31 @@ pub struct MoveNode {
     pub move_choice: MoveChoice,
     pub total_score: f32,
     pub visits: u32,
+    /// PUCT prior. `1/N_options` (uniform) when the NN is not consulted;
+    /// otherwise the per-option prior derived from Kakuna's policy via
+    /// `nn_state_encoder::map_policy_to_options`.
+    pub prior: f32,
 }
 
 impl MoveNode {
-    pub fn ucb1(&self, parent_visits: u32) -> f32 {
-        if self.visits == 0 {
-            return f32::INFINITY;
-        }
-        let score = (self.total_score / self.visits as f32)
-            + (2.0 * (parent_visits as f32).ln() / self.visits as f32).sqrt();
-        score
+    /// PUCT score: `Q + c * P * sqrt(N_parent) / (1 + N_self)`.
+    ///
+    /// Replaces the old UCB1 formula. With uniform prior `P = 1/N` and
+    /// `c_puct = sqrt(2.0)` this is asymptotically equivalent to UCB1 (the
+    /// regression suite at `mcts.rs:876-1130` is the back-compat guard).
+    /// Unvisited nodes get `Q = 0.5` (neutral); the prior-weighted U-term
+    /// breaks ties at iteration 0 in favor of high-prior moves.
+    pub fn puct(&self, parent_visits: u32, c_puct: f32) -> f32 {
+        let q = if self.visits == 0 {
+            0.5
+        } else {
+            self.total_score / self.visits as f32
+        };
+        // sqrt(N_parent) — note: at root iteration 0, parent_visits=0 → u=0
+        // so the first iteration ties at q=0.5. After the first backprop,
+        // parent_visits >= 1 and the prior dominates U for unvisited siblings.
+        let u = c_puct * self.prior * (parent_visits as f32).sqrt() / (1.0 + self.visits as f32);
+        q + u
     }
     pub fn average_score(&self) -> f32 {
         let score = self.total_score / self.visits as f32;
@@ -239,8 +273,8 @@ pub struct MctsResult {
     pub principal_variation: Vec<PrincipalVariationStep>,
 }
 
-fn do_mcts(root_node: &mut Node, state: &mut State, root_eval: &f32) {
-    let (mut new_node, s1_move, s2_move) = unsafe { root_node.selection(state) };
+fn do_mcts(root_node: &mut Node, state: &mut State, root_eval: &f32, c_puct: f32) {
+    let (mut new_node, s1_move, s2_move) = unsafe { root_node.selection(state, c_puct) };
     new_node = unsafe { (*new_node).expand(state, s1_move, s2_move) };
     let rollout_result = unsafe { (*new_node).rollout(state, root_eval) };
     unsafe { (*new_node).backpropagate(rollout_result, state) }
@@ -334,31 +368,65 @@ const MCTS_BATCH_SIZE: u32 = 1000;
 ///   in place by `do_mcts` (apply -> rollout -> reverse), so between search
 ///   invocations it MUST be back at root. This holds because every MCTS
 ///   iteration fully unwinds instructions during backpropagation.
+/// PUCT exploration constant. AlphaZero's default is 1.25; the legacy UCB1
+/// constant was `sqrt(2.0)` (~1.414). For backward compatibility on the
+/// `MctsSearch::new` path (which now defaults to c_puct=sqrt(2.0)), this
+/// keeps the regression tests happy.
+pub const DEFAULT_C_PUCT: f32 = std::f32::consts::SQRT_2;
+
 pub struct MctsSearch {
     root: Box<Node>,
     state: State,
     root_eval: f32,
+    c_puct: f32,
 }
 
 impl MctsSearch {
     /// Build a new search anchored at `state` with the given root options.
+    /// Uses the default exploration constant `DEFAULT_C_PUCT = sqrt(2)` and
+    /// uniform priors — preserves pre-Plan-E behavior.
     pub fn new(
         state: State,
         s1_options: Vec<MoveChoice>,
         s2_options: Vec<MoveChoice>,
     ) -> Self {
+        Self::new_with_priors(state, s1_options, s2_options, DEFAULT_C_PUCT, None, None)
+    }
+
+    /// Plan E variant of `new` that takes optional priors and a custom
+    /// exploration constant.
+    ///
+    /// `s1_priors`/`s2_priors`: `None` → uniform; otherwise must have length
+    /// matching the corresponding options vector. The Plan E pipeline calls
+    /// `nn_state_encoder::map_policy_to_options` to produce `s1_priors`.
+    pub fn new_with_priors(
+        state: State,
+        s1_options: Vec<MoveChoice>,
+        s2_options: Vec<MoveChoice>,
+        c_puct: f32,
+        s1_priors: Option<Vec<f32>>,
+        s2_priors: Option<Vec<f32>>,
+    ) -> Self {
         let mut root = Box::new(Node::new());
+        let s1p = s1_priors.as_deref();
+        let s2p = s2_priors.as_deref();
         // SAFETY: fresh root, no aliases yet.
         unsafe {
-            root.populate(s1_options, s2_options);
+            root.populate(s1_options, s2_options, s1p, s2p);
         }
         root.root = true;
 
+        // CRITICAL (verifier CRIT-2): root_eval is ALWAYS the heuristic.
+        // Kakuna's `v_estimate` is in raw shaped-reward Q-units (~[100, 2000])
+        // and is NOT comparable to evaluate()'s signed-f32 (~[-300, +300])
+        // scale; mixing them saturates the leaf sigmoid. NN contributes ONLY
+        // the policy prior, never the value baseline.
         let root_eval = evaluate(&state);
         MctsSearch {
             root,
             state,
             root_eval,
+            c_puct,
         }
     }
 
@@ -373,7 +441,7 @@ impl MctsSearch {
         let iterations_before = self.root.times_visited;
         while start_time.elapsed() < budget {
             for _ in 0..MCTS_BATCH_SIZE {
-                do_mcts(&mut self.root, &mut self.state, &self.root_eval);
+                do_mcts(&mut self.root, &mut self.state, &self.root_eval, self.c_puct);
             }
 
             // Cut off after 10 million iterations
