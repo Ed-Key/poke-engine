@@ -6,6 +6,7 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use clap::Parser;
 use poke_engine::mcts::{perform_mcts, MctsResult, MctsSearch};
 use poke_engine::translate::auto_detect_and_parse;
 use serde::Serialize;
@@ -15,6 +16,42 @@ use tower_http::cors::{Any, CorsLayer};
 const DEFAULT_PORT: u16 = 7267;
 const DEFAULT_TIME_LIMIT_MS: u64 = 5000;
 const DEFAULT_UPDATE_INTERVAL_MS: u64 = 250;
+
+/// CLI args for the poke-engine MCTS server.
+///
+/// All flags fall back to a matching environment variable so that the existing
+/// `PORT=7267 cargo run --bin server` invocations keep working unchanged.
+/// New flags introduced by Plan E Phase 4-5:
+///   - `--nn-eval`           POKE_ENGINE_NN_EVAL   (bool)
+///   - `--nn-url`            POKE_ENGINE_NN_URL    (default http://localhost:7273)
+///   - `--nn-timeout-ms`     POKE_ENGINE_NN_TIMEOUT_MS (default 2000)
+///   - `--c-puct`            POKE_ENGINE_C_PUCT    (default 1.25)
+#[derive(Parser, Debug, Clone)]
+#[command(name = "poke-engine-server")]
+#[command(about = "poke-engine MCTS server (axum + tokio)")]
+pub struct Cli {
+    /// TCP port to bind. (Was previously read directly from $PORT.)
+    #[arg(long, env = "PORT", default_value_t = DEFAULT_PORT)]
+    pub port: u16,
+
+    /// Enable Plan E NN-prior evaluation. Requires the metamon sidecar to be
+    /// running at `--nn-url`. When unset, behavior is identical to the
+    /// pre-Plan-E engine (heuristic-only).
+    #[arg(long, env = "POKE_ENGINE_NN_EVAL", default_value_t = false)]
+    pub nn_eval: bool,
+
+    /// Base URL of the metamon sidecar. Only consulted when `--nn-eval` is set.
+    #[arg(long, env = "POKE_ENGINE_NN_URL", default_value = "http://localhost:7273")]
+    pub nn_url: String,
+
+    /// Sidecar request timeout in milliseconds.
+    #[arg(long, env = "POKE_ENGINE_NN_TIMEOUT_MS", default_value_t = 2000)]
+    pub nn_timeout_ms: u64,
+
+    /// PUCT exploration constant. AlphaZero default is 1.25.
+    #[arg(long, env = "POKE_ENGINE_C_PUCT", default_value_t = 1.25)]
+    pub c_puct: f32,
+}
 
 // -- Request / Response types --
 
@@ -503,6 +540,26 @@ async fn analyze_stream_handler(body: String) -> impl IntoResponse {
 
 #[tokio::main]
 async fn main() {
+    // Initialize logging (RUST_LOG=info,poke_engine=debug to crank verbosity).
+    let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .try_init();
+
+    let cli = Cli::parse();
+
+    if cli.nn_eval {
+        log::info!(
+            "Plan E NN-prior mode ENABLED: nn_url={} nn_timeout_ms={} c_puct={}",
+            cli.nn_url,
+            cli.nn_timeout_ms,
+            cli.c_puct,
+        );
+    } else {
+        log::info!(
+            "Heuristic-only mode (Plan E flags inert): c_puct={}",
+            cli.c_puct
+        );
+    }
+
     // Permissive CORS: server is localhost-only, no security concern.
     // Needed so browser extensions / userscripts / dev tools can fetch directly.
     let cors = CorsLayer::new()
@@ -516,11 +573,7 @@ async fn main() {
         .route("/analyze/stream", post(analyze_stream_handler))
         .layer(cors);
 
-    let port: u16 = std::env::var("PORT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(DEFAULT_PORT);
-    let addr = format!("0.0.0.0:{}", port);
+    let addr = format!("0.0.0.0:{}", cli.port);
     println!("poke-engine MCTS server starting on {}", addr);
 
     let listener = tokio::net::TcpListener::bind(&addr)
