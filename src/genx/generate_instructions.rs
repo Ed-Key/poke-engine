@@ -3528,7 +3528,20 @@ fn run_move(
     final_instructions: &mut Vec<StateInstructions>,
 ) {
     let mut hit_sub = false;
-    for _ in 0..hit_count {
+    // Multiscale only halves the FIRST hit of a multi-hit move; hits 2..N
+    // see the defender below maxhp and deal full damage. Detect that here
+    // so we can recompute damage after iter 0 with un-halved base_power.
+    let multiscale_halved_first_hit = {
+        let defender = state
+            .get_side_immutable(&attacking_side.get_other_side())
+            .get_active_immutable();
+        does_damage
+            && hit_count > 1
+            && defender.ability == Abilities::MULTISCALE
+            && defender.hp == defender.maxhp
+    };
+    let mut damage_amount = damage_amount;
+    for i in 0..hit_count {
         if does_damage {
             hit_sub = generate_instructions_from_damage(
                 state,
@@ -3537,6 +3550,14 @@ fn run_move(
                 &attacking_side,
                 &mut instructions,
             );
+        }
+        if i == 0 && multiscale_halved_first_hit {
+            choice.base_power *= 2.0;
+            if let Some((_, max_dmg)) =
+                calculate_damage(state, &attacking_side, choice, DamageRolls::Max)
+            {
+                damage_amount = (max_dmg as f32 * 0.925) as i16;
+            }
         }
         if let Some(side_condition) = &choice.side_condition {
             generate_instructions_from_side_conditions(
