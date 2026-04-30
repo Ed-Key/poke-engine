@@ -1127,4 +1127,30 @@ mod tests {
         let diff_low = (super::evaluate(&state_low) - bd_low.total).abs();
         assert!(diff_low < 0.001, "invariant broken at 30% HP: diff={}", diff_low);
     }
+
+    #[test]
+    fn test_boost_reward_independent_of_hp() {
+        // Post-fix invariant: the boost reward must NOT depend on HP.
+        // Foul-play (NeurIPS 2025 Gen9OU winner) gives flat boost credit;
+        // HP-conditional gating double-counted with threat_score × 40 and
+        // produced a 40-70% HP blind zone for setup sweepers.
+        //
+        // Construct a state with side_one's active at +2 SpA and compare the
+        // boost contribution at 100% HP vs. 30% HP. They MUST be equal.
+        let mut state_full = State::default();
+        state_full.side_one.special_attack_boost = 2;
+        let bd_full = super::evaluate_breakdown(&state_full);
+
+        let mut state_low = State::default();
+        state_low.side_one.special_attack_boost = 2;
+        state_low.side_one.get_active().hp = 30;
+        let bd_low = super::evaluate_breakdown(&state_low);
+
+        assert!(
+            (bd_full.boost_term_s1 - bd_low.boost_term_s1).abs() < 0.001,
+            "boost_term_s1 must be HP-independent post fix; full={}, low={}",
+            bd_full.boost_term_s1,
+            bd_low.boost_term_s1
+        );
+    }
 }
