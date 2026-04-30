@@ -15582,6 +15582,108 @@ fn test_scaleshot_only_boosts_once() {
     assert_eq!(expected_instructions, vec_of_instructions);
 }
 
+// Regression test for suspected speed-tier propagation bug (battle 2598303202 T8/T9).
+// Scenario: Garchomp uses Scale Shot (+1 Spe to user). Next turn, the boosted Garchomp
+// must outspeed Urshifu where it previously did not.
+//
+// At base speeds: side_one = 100 (Garchomp-ish), side_two = 110 (Urshifu-ish).
+// Side_two outspeeds at +0. After Scale Shot (+1 Spe), side_one effective = 150, beats 110.
+//
+// If MCTS state propagation is correct: speed_boost survives apply_instructions, and
+// calculate_boosted_stat(Speed) returns 150 for side_one. The follow-up turn should
+// resolve side_one's TACKLE damage BEFORE side_two's TACKLE damage.
+#[test]
+fn test_scaleshot_speed_boost_propagates_to_next_turn() {
+    let mut state = State::default();
+    state.side_one.get_active().speed = 100;
+    state.side_one.get_active().hp = 200;
+    state.side_one.get_active().maxhp = 200;
+    state.side_two.get_active().speed = 110;
+    state.side_two.get_active().hp = 200;
+    state.side_two.get_active().maxhp = 200;
+
+    // Sanity: at +0, side_two outspeeds.
+    assert!(
+        state.side_two.calculate_boosted_stat(PokemonBoostableStat::Speed)
+            > state.side_one.calculate_boosted_stat(PokemonBoostableStat::Speed),
+        "precondition: side_two should outspeed side_one before any boosts"
+    );
+
+    // Turn 1: side_one uses Scale Shot, side_two uses Splash.
+    // Pick the 100% branch (Scale Shot lands; we don't care about damage roll branches here).
+    let turn1 = set_moves_on_pkmn_and_call_generate_instructions(
+        &mut state,
+        Choices::SCALESHOT,
+        Choices::SPLASH,
+    );
+    let landed = turn1
+        .iter()
+        .find(|si| {
+            si.instruction_list.iter().any(|i| matches!(
+                i,
+                Instruction::Boost(b) if b.stat == PokemonBoostableStat::Speed && b.amount == 1
+            ))
+        })
+        .expect("expected at least one branch where Scale Shot lands and applies +1 Spe");
+    state.apply_instructions(&landed.instruction_list);
+
+    // Post-turn-1: speed_boost should be +1 on side_one.
+    assert_eq!(
+        1, state.side_one.speed_boost,
+        "Scale Shot should leave side_one with +1 Spe boost after apply_instructions"
+    );
+
+    // Verify boosted stat reflects the +1 (1.5x).
+    let boosted_one = state.side_one.calculate_boosted_stat(PokemonBoostableStat::Speed);
+    let boosted_two = state.side_two.calculate_boosted_stat(PokemonBoostableStat::Speed);
+    assert_eq!(
+        150, boosted_one,
+        "side_one's boosted speed should be 150 (100 * 1.5)"
+    );
+    assert_eq!(110, boosted_two, "side_two's boosted speed should be 110");
+    assert!(
+        boosted_one > boosted_two,
+        "after Scale Shot, side_one ({}) should outspeed side_two ({})",
+        boosted_one,
+        boosted_two,
+    );
+
+    // Turn 2: both use TACKLE. Side_one (boosted) should hit FIRST.
+    let turn2 = set_moves_on_pkmn_and_call_generate_instructions(
+        &mut state,
+        Choices::TACKLE,
+        Choices::TACKLE,
+    );
+    // The deterministic branch (no speed-tie) should have a single primary outcome:
+    // damage to side_two BEFORE damage to side_one.
+    assert_eq!(
+        1,
+        turn2.len(),
+        "expected exactly one branch (no speed tie); got {} branches: {:?}",
+        turn2.len(),
+        turn2,
+    );
+    let ins = &turn2[0].instruction_list;
+    let pos_dmg_to_side_two = ins.iter().position(|i| matches!(
+        i,
+        Instruction::Damage(d) if d.side_ref == SideReference::SideTwo
+    ));
+    let pos_dmg_to_side_one = ins.iter().position(|i| matches!(
+        i,
+        Instruction::Damage(d) if d.side_ref == SideReference::SideOne
+    ));
+    assert!(
+        pos_dmg_to_side_two.is_some() && pos_dmg_to_side_one.is_some(),
+        "expected damage to both sides; got {:?}",
+        ins,
+    );
+    assert!(
+        pos_dmg_to_side_two.unwrap() < pos_dmg_to_side_one.unwrap(),
+        "side_one (boosted) should attack first; got instructions: {:?}",
+        ins,
+    );
+}
+
 #[test]
 fn test_lifeorb_hitting_sub() {
     let mut state = State::default();
