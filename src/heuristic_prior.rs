@@ -5,8 +5,10 @@
 //! alternatives that Kakuna's overconfident policy would otherwise starve.
 //! See docs/superpowers/specs/2026-04-30-plan-i-prior-dampening-design.md.
 
-use crate::choices::{Choice, Choices, MoveCategory};
+use crate::choices::{Choice, Choices, MoveCategory, MultiHitMove};
+use crate::engine::abilities::Abilities;
 use crate::engine::damage_calc::{calculate_damage, type_effectiveness_modifier, DamageRolls};
+use crate::engine::items::Items;
 use crate::engine::state::MoveChoice;
 use crate::nn_client::ACTION_DIM;
 use crate::nn_state_encoder::{
@@ -14,7 +16,7 @@ use crate::nn_state_encoder::{
     reserve_slot_for, reserve_species, SidePerspective,
 };
 use crate::pokemon::PokemonName;
-use crate::state::{Pokemon, SideReference, State};
+use crate::state::{Pokemon, PokemonIndex, PokemonType, SideConditions, SideReference, State};
 
 #[derive(Debug, Clone)]
 pub struct HeuristicPrior {
@@ -123,6 +125,120 @@ fn matchup_score_against(opp: &Pokemon, candidate: &Pokemon) -> f32 {
     incoming - outgoing
 }
 
+/// Compute hazard damage that `candidate` would take on entry into the
+/// given side, mirroring `genx/generate_instructions.rs:441-475`.
+///
+/// Heavy-Duty Boots and Magic Guard fully gate hazard damage. Stealth
+/// Rock damage scales by Rock-type effectiveness. Spikes damage uses
+/// the engine's `maxhp * spikes_count / 8` formula (1 layer = 1/8,
+/// 2 = 1/4, 3 = 3/8) and only applies to grounded Pokemon. Sticky Web
+/// (stat drop) and Toxic Spikes (status) are not damage, so they are
+/// excluded.
+fn hazard_damage_on_entry(candidate: &Pokemon, side_conditions: &SideConditions) -> i16 {
+    if candidate.item == Items::HEAVYDUTYBOOTS {
+        return 0;
+    }
+    if candidate.ability == Abilities::MAGICGUARD {
+        return 0;
+    }
+
+    let mut total: i16 = 0;
+
+    if side_conditions.stealth_rock == 1 {
+        let multiplier = type_effectiveness_modifier(&PokemonType::ROCK, candidate);
+        let dmg = (candidate.maxhp as f32 * multiplier / 8.0) as i16;
+        total = total.saturating_add(dmg);
+    }
+
+    if side_conditions.spikes > 0 && candidate.is_grounded() {
+        let dmg = candidate.maxhp * side_conditions.spikes as i16 / 8;
+        total = total.saturating_add(dmg);
+    }
+
+    total
+}
+
+/// Average expected hits for a multi-hit move. Returns 1.0 for
+/// non-multi-hit moves. Used to scale single-hit damage from
+/// `calculate_damage` (which doesn't know about multi-hit) into
+/// expected total damage.
+///
+/// 2-5 hits in gen 5+ averages ~3.166 (35/35/15/15 weighted on 2/3/4/5).
+/// Population Bomb (1-10 hits) averages ~6.25 with accuracy decay.
+/// Triple Axel: 1+2+3 hits weighted by per-hit accuracy (~2.43 effective).
+fn multi_hit_expected_hits(multi_hit: MultiHitMove) -> f32 {
+    match multi_hit {
+        MultiHitMove::None => 1.0,
+        MultiHitMove::DoubleHit => 2.0,
+        MultiHitMove::TripleHit => 3.0,
+        MultiHitMove::TwoToFiveHits => 3.166,
+        MultiHitMove::PopulationBomb => 6.25,
+        MultiHitMove::TripleAxel => 2.43,
+    }
+}
+
+/// Predict the worst-case damage the opposing active would deal to
+/// `candidate_idx` if our side switched it in. We clone the state,
+/// swap our active to the candidate, then iterate the opp's legal
+/// damaging moves under `DamageRolls::Max`.
+///
+/// Mirrors `damage_calc_top_move`'s filter (skip disabled, no PP,
+/// status, switch). Multi-hit moves are scaled by expected hit count
+/// since `calculate_damage` returns single-hit damage.
+fn predicted_opp_max_damage_against(
+    state: &State,
+    candidate_idx: PokemonIndex,
+    perspective: SidePerspective,
+) -> i16 {
+    let mut sim = state.clone();
+    let (my_side_mut, opp_side_ref) = match perspective {
+        SidePerspective::Side1 => (&mut sim.side_one, SideReference::SideTwo),
+        SidePerspective::Side2 => (&mut sim.side_two, SideReference::SideOne),
+    };
+    my_side_mut.active_index = candidate_idx;
+
+    let opp = match perspective {
+        SidePerspective::Side1 => sim.side_two.get_active_immutable(),
+        SidePerspective::Side2 => sim.side_one.get_active_immutable(),
+    };
+
+    let mut max_dmg: i16 = 0;
+    for mv in opp.moves.into_iter() {
+        if mv.disabled || mv.pp <= 0 {
+            continue;
+        }
+        let choice: &Choice = &mv.choice;
+        if choice.category == MoveCategory::Status || choice.category == MoveCategory::Switch {
+            continue;
+        }
+        if let Some((dmg, _crit)) =
+            calculate_damage(&sim, &opp_side_ref, choice, DamageRolls::Max)
+        {
+            if dmg > 0 {
+                let hits = multi_hit_expected_hits(choice.multi_hit());
+                let total = (dmg as f32 * hits) as i16;
+                if total > max_dmg {
+                    max_dmg = total;
+                }
+            }
+        }
+    }
+
+    max_dmg
+}
+
+/// Survivability-aware switch picker (Plan I, Fix #1).
+///
+/// Pre-filters bench candidates that would die on entry (hazards +
+/// predicted opponent top damage exceed effective HP), then ranks
+/// survivors by `(incoming_type_eff - outgoing_type_eff) - 0.5 ×
+/// hp_fraction`. Lower is better; HP fraction acts as a tiebreaker
+/// favoring healthier Pokemon when type matchups are equivalent.
+///
+/// Returns None when:
+///   - `force_trapped` is set (volatile traps are filtered downstream).
+///   - All bench candidates die on entry under the worst-case prediction.
+///   - No bench candidates exist (last alive).
 pub fn matchup_switch_pick(
     state: &State,
     perspective: SidePerspective,
@@ -145,7 +261,36 @@ pub fn matchup_switch_pick(
         if pkmn.hp <= 0 {
             continue;
         }
-        let score = matchup_score_against(opp, pkmn);
+
+        // Pre-filter: hazards on MY side affect MY switch-in.
+        let hazard_dmg = hazard_damage_on_entry(pkmn, &my_side.side_conditions);
+        let effective_hp = pkmn.hp - hazard_dmg;
+        if effective_hp <= 0 {
+            continue;
+        }
+
+        let candidate_idx = match idx {
+            0 => PokemonIndex::P0,
+            1 => PokemonIndex::P1,
+            2 => PokemonIndex::P2,
+            3 => PokemonIndex::P3,
+            4 => PokemonIndex::P4,
+            _ => PokemonIndex::P5,
+        };
+        let incoming_dmg = predicted_opp_max_damage_against(state, candidate_idx, perspective);
+        if effective_hp - incoming_dmg <= 0 {
+            continue;
+        }
+
+        // Survivor: score by type matchup with HP-fraction tiebreaker.
+        let matchup = matchup_score_against(opp, pkmn);
+        let hp_fraction = if pkmn.maxhp > 0 {
+            pkmn.hp as f32 / pkmn.maxhp as f32
+        } else {
+            0.0
+        };
+        let score = matchup - 0.5 * hp_fraction;
+
         match best {
             None => best = Some((pkmn.id, score)),
             Some((_, best_score)) if score < best_score => {
