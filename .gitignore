@@ -5,3 +5,6 @@
 *.so
 **__pycache**
 poke-engine-py/docs/build/
+
+# Worktrees for parallel development
+.worktrees/
