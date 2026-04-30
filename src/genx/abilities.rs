@@ -666,6 +666,31 @@ pub fn ability_before_move(
                 instructions.instruction_list.push(i);
             }
         }
+        Abilities::STANCECHANGE => {
+            if active_pkmn.id == PokemonName::AEGISLASH
+                && choice.category != MoveCategory::Status
+            {
+                instructions.instruction_list.push(Instruction::FormeChange(
+                    FormeChangeInstruction {
+                        side_ref: *side_ref,
+                        name_change: PokemonName::AEGISLASHBLADE as i16 - active_pkmn.id as i16,
+                    },
+                ));
+                active_pkmn.id = PokemonName::AEGISLASHBLADE;
+                active_pkmn.recalculate_stats(side_ref, instructions);
+            } else if active_pkmn.id == PokemonName::AEGISLASHBLADE
+                && choice.move_id == Choices::KINGSSHIELD
+            {
+                instructions.instruction_list.push(Instruction::FormeChange(
+                    FormeChangeInstruction {
+                        side_ref: *side_ref,
+                        name_change: PokemonName::AEGISLASH as i16 - active_pkmn.id as i16,
+                    },
+                ));
+                active_pkmn.id = PokemonName::AEGISLASH;
+                active_pkmn.recalculate_stats(side_ref, instructions);
+            }
+        }
         _ => {}
     }
 }
@@ -1412,6 +1437,18 @@ pub fn ability_on_switch_in(
                     },
                 ));
                 active_pkmn.id = PokemonName::EISCUE;
+                active_pkmn.recalculate_stats(side_ref, instructions);
+            }
+        }
+        Abilities::STANCECHANGE => {
+            if active_pkmn.id == PokemonName::AEGISLASHBLADE {
+                instructions.instruction_list.push(Instruction::FormeChange(
+                    FormeChangeInstruction {
+                        side_ref: *side_ref,
+                        name_change: PokemonName::AEGISLASH as i16 - active_pkmn.id as i16,
+                    },
+                ));
+                active_pkmn.id = PokemonName::AEGISLASH;
                 active_pkmn.recalculate_stats(side_ref, instructions);
             }
         }

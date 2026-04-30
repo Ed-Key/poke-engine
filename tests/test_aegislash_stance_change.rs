@@ -23,7 +23,7 @@ use poke_engine::engine::generate_instructions::generate_instructions_from_move_
 use poke_engine::engine::state::MoveChoice;
 use poke_engine::instruction::{FormeChangeInstruction, Instruction, StateInstructions};
 use poke_engine::pokemon::PokemonName;
-use poke_engine::state::{PokemonMoveIndex, PokemonType, SideReference, State};
+use poke_engine::state::{PokemonIndex, PokemonMoveIndex, PokemonType, SideReference, State};
 
 fn set_moves_and_run(
     state: &mut State,
@@ -198,5 +198,46 @@ fn stance_change_does_not_fire_on_non_kings_shield_status_move() {
         "no FormeChange should fire when AEGISLASH uses a non-damaging, non-King's-Shield move. \
          got: {:?}",
         branches,
+    );
+}
+
+// --------------------------------------------------------------------------
+// Test 5 — Switching in Aegislash-Blade reverts it to Aegislash (Shield).
+//
+// Showdown's actual behavior: Aegislash always returns to Shield form on
+// switch-in. Without this revert, an Aegislash that swapped to Blade and
+// switched out would stay Blade in the engine's simulation.
+// --------------------------------------------------------------------------
+#[test]
+fn stance_change_reverts_to_shield_on_switch_in() {
+    let mut state = State::default();
+    // Bench Pokemon at P1 is Aegislash-Blade with Stance Change.
+    state.side_one.pokemon[PokemonIndex::P1].id = PokemonName::AEGISLASHBLADE;
+    state.side_one.pokemon[PokemonIndex::P1].ability = Abilities::STANCECHANGE;
+
+    let branches = generate_instructions_from_move_pair(
+        &mut state,
+        &MoveChoice::Switch(PokemonIndex::P1),
+        &MoveChoice::None,
+        false,
+    );
+
+    let fc = first_forme_change(&branches)
+        .expect("expected a FormeChange instruction when AEGISLASHBLADE switches in");
+    assert_eq!(fc.side_ref, SideReference::SideOne);
+    assert_eq!(
+        fc.name_change,
+        PokemonName::AEGISLASH as i16 - PokemonName::AEGISLASHBLADE as i16,
+        "name_change delta should swap AEGISLASHBLADE -> AEGISLASH on switch-in",
+    );
+
+    // After applying the instructions of the first branch, the active Pokemon
+    // should be Aegislash (Shield form).
+    let first_branch = branches.first().expect("expected at least one branch");
+    state.apply_instructions(&first_branch.instruction_list);
+    assert_eq!(
+        state.side_one.get_active().id,
+        PokemonName::AEGISLASH,
+        "Aegislash-Blade should revert to Aegislash (Shield) on switch-in",
     );
 }
