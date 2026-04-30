@@ -53,6 +53,15 @@ pub struct SideInput {
     /// present (standard sub HP at creation).
     #[serde(default)]
     pub substitute_health: Option<i16>,
+    /// Last move used by the active Pokemon, in poke-engine's
+    /// `LastUsedMove::deserialize` format: `"move:<idx>"` for an active
+    /// move at index 0..3, `"switch:<idx>"` for a just-came-in switch,
+    /// or `"move:none"` for "nothing previously". Without this, choice-
+    /// locked opponents (Scarf Urshifu locked into Surging Strikes, CB
+    /// Dragonite locked into Outrage) are evaluated as if all 4 moves
+    /// are usable. Engine reads via `Side.last_used_move` (state.rs:1010).
+    #[serde(default)]
+    pub last_used_move: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -448,6 +457,7 @@ fn fabric_aux_side_to_input(side: &FabricAuxSide) -> SideInput {
         force_trapped: false,
         force_switch: false,
         substitute_health: None,
+        last_used_move: None,
     }
 }
 
@@ -467,6 +477,7 @@ pub fn from_fabric_aux(state: &FabricAuxState) -> State {
             force_trapped: false,
             force_switch: false,
             substitute_health: None,
+            last_used_move: None,
         }
     };
 
@@ -482,6 +493,7 @@ pub fn from_fabric_aux(state: &FabricAuxState) -> State {
             force_trapped: false,
             force_switch: false,
             substitute_health: None,
+            last_used_move: None,
         }
     };
 
@@ -792,7 +804,10 @@ fn serialize_side(side: &SideInput) -> String {
         false,                      // [24] baton_passing
         false,                      // [25] shed_tailing
         side.force_trapped,         // [26] force_trapped
-        "switch:0",                 // [27] last_used_move
+        // [27] last_used_move — must be in LastUsedMove::deserialize format:
+        // `move:<idx>` (0..3), `switch:<idx>`, or `move:none`. Bare `none`
+        // panics the deserializer (state.rs:74).
+        side.last_used_move.as_deref().unwrap_or("move:none"),
         false,                      // [28] slow_uturn_move
     )
 }
