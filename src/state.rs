@@ -1256,6 +1256,9 @@ pub struct State {
     pub team_preview: bool,
     pub use_last_used_move: bool,
     pub use_damage_dealt: bool,
+    /// When true (e.g. NatDex OU 2026 Tera ban), `MoveTera` actions are
+    /// suppressed at root and during search. Default false.
+    pub tera_banned: bool,
 }
 impl Default for State {
     fn default() -> State {
@@ -1277,6 +1280,7 @@ impl Default for State {
             team_preview: false,
             use_damage_dealt: false,
             use_last_used_move: false,
+            tera_banned: false,
         };
 
         // many tests rely on the speed of side 2's active pokemon being greater than side_one's
@@ -2322,6 +2326,7 @@ impl State {
             team_preview: split[5].parse::<bool>().unwrap(),
             use_damage_dealt: false,
             use_last_used_move: false,
+            tera_banned: false,
         };
         state.set_conditional_mechanics();
         state

@@ -877,7 +877,7 @@ impl State {
                 &self.side_one.last_used_move,
                 encored,
                 taunted,
-                self.side_one.can_use_tera(),
+                self.side_one.can_use_tera() && !self.tera_banned,
             );
         }
 
@@ -903,7 +903,7 @@ impl State {
                 &self.side_two.last_used_move,
                 encored,
                 taunted,
-                self.side_two.can_use_tera(),
+                self.side_two.can_use_tera() && !self.tera_banned,
             );
         }
 
@@ -991,7 +991,7 @@ impl State {
                 &self.side_one.last_used_move,
                 encored,
                 taunted,
-                self.side_one.can_use_tera(),
+                self.side_one.can_use_tera() && !self.tera_banned,
             );
             if !self.side_one.trapped(side_two_active) {
                 self.side_one.add_switches(&mut side_one_options);
@@ -1020,7 +1020,7 @@ impl State {
                 &self.side_two.last_used_move,
                 encored,
                 taunted,
-                self.side_two.can_use_tera(),
+                self.side_two.can_use_tera() && !self.tera_banned,
             );
             if !self.side_two.trapped(side_one_active) {
                 self.side_two.add_switches(&mut side_two_options);

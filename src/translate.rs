@@ -24,6 +24,10 @@ pub struct BattleRequest {
     pub trick_room: bool,
     #[serde(default)]
     pub trick_room_turns: Option<i8>,
+    /// Format-level Tera ban (e.g. NatDex OU 2026). When true, MoveTera
+    /// actions are excluded from search.
+    #[serde(default = "default_false")]
+    pub tera_banned: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -502,6 +506,7 @@ pub fn from_fabric_aux(state: &FabricAuxState) -> State {
         terrain,
         trick_room: false,
         trick_room_turns: None,
+        tera_banned: false,
     };
 
     to_poke_state(&request)
@@ -815,7 +820,9 @@ pub fn to_poke_state(request: &BattleRequest) -> State {
         false, // team_preview is always false during battle
     );
 
-    State::deserialize(&serialized)
+    let mut state = State::deserialize(&serialized);
+    state.tera_banned = request.tera_banned;
+    state
 }
 
 /// Convenience wrapper that parses JSON directly into a `State`.
