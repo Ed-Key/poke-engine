@@ -34,6 +34,28 @@ const POKEMON_BOOST_MULTIPLIER_NEG_4: f32 = -3.0;
 const POKEMON_BOOST_MULTIPLIER_NEG_5: f32 = -3.15;
 const POKEMON_BOOST_MULTIPLIER_NEG_6: f32 = -3.3;
 
+/// Bracketed HP-aware multiplier for the active Pokemon's boost rewards,
+/// inspired by Metamon Kaizo's setup schedule
+/// (metamon/baselines/heuristic/kaizo.py:185-228). Replaces the previous
+/// linear `hp/maxhp` multiplier, which still gave 54% credit at 54% HP and
+/// caused the engine to recommend setup (DD, Nasty Plot, etc.) into known
+/// KO threats.
+///
+/// Step function:
+///   HP > 70%  → full reward (Kaizo "neutral")
+///   40-70%    → zero (Kaizo would apply -2; cleanest map to our scale)
+///   < 40%     → slightly negative (actually penalize setup at low HP)
+fn boost_hp_multiplier(hp: i16, maxhp: i16) -> f32 {
+    let pct = (hp as f32) / (maxhp as f32).max(1.0);
+    if pct > 0.70 {
+        1.0
+    } else if pct >= 0.40 {
+        0.0
+    } else {
+        -0.5
+    }
+}
+
 const POKEMON_FROZEN: f32 = -40.0;
 const POKEMON_ASLEEP: f32 = -25.0;
 const POKEMON_PARALYZED: f32 = -25.0;
@@ -404,13 +426,20 @@ pub fn evaluate(state: &State) -> f32 {
                     }
                 }
 
-                score += get_boost_multiplier(state.side_one.attack_boost) * POKEMON_ATTACK_BOOST;
-                score += get_boost_multiplier(state.side_one.defense_boost) * POKEMON_DEFENSE_BOOST;
+                // HP-aware setup penalty (Kaizo bracketed schedule): a +2 boost
+                // is only valuable if the boosted Pokemon survives to deploy it.
+                // The previous linear `hp/maxhp` scaling still credited setup at
+                // 54% HP (Dragonite DD into a known KO). The bracketed step
+                // function hard-zeros the reward in the 40-70% band and
+                // negatively scores setup below 40%.
+                let s1_hp_ratio = boost_hp_multiplier(pkmn.hp, pkmn.maxhp);
+                score += get_boost_multiplier(state.side_one.attack_boost) * POKEMON_ATTACK_BOOST * s1_hp_ratio;
+                score += get_boost_multiplier(state.side_one.defense_boost) * POKEMON_DEFENSE_BOOST * s1_hp_ratio;
                 score += get_boost_multiplier(state.side_one.special_attack_boost)
-                    * POKEMON_SPECIAL_ATTACK_BOOST;
+                    * POKEMON_SPECIAL_ATTACK_BOOST * s1_hp_ratio;
                 score += get_boost_multiplier(state.side_one.special_defense_boost)
-                    * POKEMON_SPECIAL_DEFENSE_BOOST;
-                score += get_boost_multiplier(state.side_one.speed_boost) * POKEMON_SPEED_BOOST;
+                    * POKEMON_SPECIAL_DEFENSE_BOOST * s1_hp_ratio;
+                score += get_boost_multiplier(state.side_one.speed_boost) * POKEMON_SPEED_BOOST * s1_hp_ratio;
                 score += threat_score(state, &SideReference::SideOne) * THREAT_SCORE_WEIGHT;
                 score -= mortality_score(state, &SideReference::SideOne) * MORTALITY_SCORE_WEIGHT;
                 score += status_threat_score(state, &SideReference::SideOne) * STATUS_THREAT_WEIGHT;
@@ -440,13 +469,16 @@ pub fn evaluate(state: &State) -> f32 {
                     }
                 }
 
-                score -= get_boost_multiplier(state.side_two.attack_boost) * POKEMON_ATTACK_BOOST;
-                score -= get_boost_multiplier(state.side_two.defense_boost) * POKEMON_DEFENSE_BOOST;
+                // HP-aware setup penalty (mirror of side_one): Kaizo bracketed
+                // schedule, see boost_hp_multiplier docs.
+                let s2_hp_ratio = boost_hp_multiplier(pkmn.hp, pkmn.maxhp);
+                score -= get_boost_multiplier(state.side_two.attack_boost) * POKEMON_ATTACK_BOOST * s2_hp_ratio;
+                score -= get_boost_multiplier(state.side_two.defense_boost) * POKEMON_DEFENSE_BOOST * s2_hp_ratio;
                 score -= get_boost_multiplier(state.side_two.special_attack_boost)
-                    * POKEMON_SPECIAL_ATTACK_BOOST;
+                    * POKEMON_SPECIAL_ATTACK_BOOST * s2_hp_ratio;
                 score -= get_boost_multiplier(state.side_two.special_defense_boost)
-                    * POKEMON_SPECIAL_DEFENSE_BOOST;
-                score -= get_boost_multiplier(state.side_two.speed_boost) * POKEMON_SPEED_BOOST;
+                    * POKEMON_SPECIAL_DEFENSE_BOOST * s2_hp_ratio;
+                score -= get_boost_multiplier(state.side_two.speed_boost) * POKEMON_SPEED_BOOST * s2_hp_ratio;
                 score -= threat_score(state, &SideReference::SideTwo) * THREAT_SCORE_WEIGHT;
                 score += mortality_score(state, &SideReference::SideTwo) * MORTALITY_SCORE_WEIGHT;
                 score -= status_threat_score(state, &SideReference::SideTwo) * STATUS_THREAT_WEIGHT;
@@ -807,5 +839,21 @@ mod tests {
         // Score is deterministic.
         let score_again = super::evaluate(&state);
         assert_eq!(score_baseline, score_again, "evaluate must be deterministic");
+    }
+
+    #[test]
+    fn test_boost_hp_multiplier_kaizo_brackets() {
+        // Direct unit test of the bracketed schedule itself.
+        // > 70% HP → full reward
+        assert_eq!(super::boost_hp_multiplier(100, 100), 1.0);
+        assert_eq!(super::boost_hp_multiplier(80, 100), 1.0);
+        assert_eq!(super::boost_hp_multiplier(71, 100), 1.0);
+        // 40-70% HP → zero reward (the load-bearing change)
+        assert_eq!(super::boost_hp_multiplier(70, 100), 0.0);
+        assert_eq!(super::boost_hp_multiplier(54, 100), 0.0); // Dragonite-DD scenario
+        assert_eq!(super::boost_hp_multiplier(40, 100), 0.0);
+        // < 40% HP → negative reward (penalize setup)
+        assert_eq!(super::boost_hp_multiplier(39, 100), -0.5);
+        assert_eq!(super::boost_hp_multiplier(1, 100), -0.5);
     }
 }
