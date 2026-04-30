@@ -1011,6 +1011,31 @@ pub fn ability_after_damage_hit(
         }
         _ => {}
     }
+
+    // Defender-item triggers that fire per hit on contact damage.
+    // Rocky Helmet: 1/6 max HP recoil to attacker on each contact hit
+    // (so multi-hit contact moves like Surging Strikes / Triple Axel /
+    // Bullet Seed take recoil per hit, not per move). Magic Guard negates.
+    let (attacking_side, defending_side) = state.get_both_sides(side_ref);
+    let attacking_pkmn = attacking_side.get_active();
+    let defending_pkmn_item = defending_side.get_active_immutable().item;
+    if defending_pkmn_item == Items::ROCKYHELMET
+        && damage_dealt > 0
+        && choice.flags.contact
+        && attacking_pkmn.hp > 0
+        && attacking_pkmn.ability != Abilities::MAGICGUARD
+    {
+        let recoil = cmp::min(attacking_pkmn.maxhp / 6, attacking_pkmn.hp);
+        if recoil > 0 {
+            instructions
+                .instruction_list
+                .push(Instruction::Damage(DamageInstruction {
+                    side_ref: *side_ref,
+                    damage_amount: recoil,
+                }));
+            attacking_pkmn.hp -= recoil;
+        }
+    }
 }
 
 pub fn ability_on_switch_out(

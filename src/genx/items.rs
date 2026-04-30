@@ -991,13 +991,10 @@ pub fn item_modify_attack_against(
             attacking_choice.base_power /= 1.5;
         }
         Items::ROCKYHELMET => {
-            if attacking_choice.flags.contact {
-                attacking_choice.add_or_create_secondaries(Secondary {
-                    chance: 100.0,
-                    effect: Effect::Heal(-0.166),
-                    target: MoveTarget::User,
-                })
-            }
+            // Rocky Helmet recoil is applied PER HIT inside the multi-hit loop,
+            // see ability_after_damage_hit in abilities.rs. Handling it as a
+            // Secondary here would only fire once per move, undercounting the
+            // recoil for multi-hit contact moves like Surging Strikes.
         }
         Items::WEAKNESSPOLICY => {
             if attacking_choice.category != MoveCategory::Status

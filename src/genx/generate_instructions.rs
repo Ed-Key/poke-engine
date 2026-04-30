@@ -5290,6 +5290,117 @@ mod tests {
     }
 
     #[test]
+    fn test_rocky_helmet_recoil_per_hit_on_multihit_contact_move() {
+        // Surging Strikes (3-hit contact) vs Rocky Helmet defender:
+        // attacker should take maxhp/6 recoil PER HIT, not once per move.
+        // With default maxhp=100, that's 16 + 16 + 16 = 48 HP recoil total.
+        let mut state: State = State::default();
+        state.side_two.get_active().item = Items::ROCKYHELMET;
+        let mut choice = MOVES.get(&Choices::SURGINGSTRIKES).unwrap().to_owned();
+
+        let mut instructions = vec![];
+        generate_instructions_from_move(
+            &mut state,
+            &mut choice,
+            &MOVES.get(&Choices::TACKLE).unwrap(),
+            SideReference::SideOne,
+            StateInstructions::default(),
+            &mut instructions,
+            false,
+        );
+
+        // Sum up RH recoil instructions targeted at the attacker (SideOne).
+        let attacker_self_damage: i16 = instructions
+            .iter()
+            .flat_map(|si| si.instruction_list.iter())
+            .filter_map(|ins| match ins {
+                Instruction::Damage(d) if d.side_ref == SideReference::SideOne => {
+                    Some(d.damage_amount)
+                }
+                _ => None,
+            })
+            .sum();
+
+        let expected_recoil_per_hit = 100 / 6; // 16
+        let expected_total = expected_recoil_per_hit * 3; // 48
+        assert_eq!(
+            attacker_self_damage, expected_total,
+            "Surging Strikes (3 hits) vs Rocky Helmet should deal {} total recoil, got {}",
+            expected_total, attacker_self_damage
+        );
+    }
+
+    #[test]
+    fn test_rocky_helmet_recoil_negated_by_magic_guard() {
+        let mut state: State = State::default();
+        state.side_one.get_active().ability = Abilities::MAGICGUARD;
+        state.side_two.get_active().item = Items::ROCKYHELMET;
+        let mut choice = MOVES.get(&Choices::SURGINGSTRIKES).unwrap().to_owned();
+
+        let mut instructions = vec![];
+        generate_instructions_from_move(
+            &mut state,
+            &mut choice,
+            &MOVES.get(&Choices::TACKLE).unwrap(),
+            SideReference::SideOne,
+            StateInstructions::default(),
+            &mut instructions,
+            false,
+        );
+
+        let attacker_self_damage: i16 = instructions
+            .iter()
+            .flat_map(|si| si.instruction_list.iter())
+            .filter_map(|ins| match ins {
+                Instruction::Damage(d) if d.side_ref == SideReference::SideOne => {
+                    Some(d.damage_amount)
+                }
+                _ => None,
+            })
+            .sum();
+
+        assert_eq!(
+            attacker_self_damage, 0,
+            "Magic Guard should negate Rocky Helmet recoil"
+        );
+    }
+
+    #[test]
+    fn test_rocky_helmet_does_not_trigger_on_noncontact_move() {
+        let mut state: State = State::default();
+        state.side_two.get_active().item = Items::ROCKYHELMET;
+        // WATERGUN is non-contact
+        let mut choice = MOVES.get(&Choices::WATERGUN).unwrap().to_owned();
+
+        let mut instructions = vec![];
+        generate_instructions_from_move(
+            &mut state,
+            &mut choice,
+            &MOVES.get(&Choices::TACKLE).unwrap(),
+            SideReference::SideOne,
+            StateInstructions::default(),
+            &mut instructions,
+            false,
+        );
+
+        let attacker_self_damage: i16 = instructions
+            .iter()
+            .flat_map(|si| si.instruction_list.iter())
+            .filter_map(|ins| match ins {
+                Instruction::Damage(d) if d.side_ref == SideReference::SideOne => {
+                    Some(d.damage_amount)
+                }
+                _ => None,
+            })
+            .sum();
+
+        assert_eq!(
+            attacker_self_damage, 0,
+            "Rocky Helmet should not trigger on non-contact moves"
+        );
+    }
+
+    #[test]
     fn test_flamebody_versus_noncontact_move() {
         let mut state: State = State::default();
         state.side_two.get_active().ability = Abilities::FLAMEBODY;

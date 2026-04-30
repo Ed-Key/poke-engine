@@ -4735,6 +4735,9 @@ fn test_rockyhelmet_damage_taken() {
         Choices::SPLASH,
     );
 
+    // Rocky Helmet recoil now fires per-hit alongside Iron Barbs / Rough Skin
+    // (Damage instruction targeting attacker), instead of as a once-per-move
+    // Secondary Heal(-N). Single-hit Tackle => 1 hit => 1 recoil instruction.
     let expected_instructions = vec![StateInstructions {
         percentage: 100.0,
         instruction_list: vec![
@@ -4742,9 +4745,9 @@ fn test_rockyhelmet_damage_taken() {
                 side_ref: SideReference::SideTwo,
                 damage_amount: 48,
             }),
-            Instruction::Heal(HealInstruction {
+            Instruction::Damage(DamageInstruction {
                 side_ref: SideReference::SideOne,
-                heal_amount: -16,
+                damage_amount: 16,
             }),
         ],
     }];
@@ -5550,6 +5553,7 @@ fn test_rockyhelmet_does_not_overkill() {
         Choices::SPLASH,
     );
 
+    // Capped at attacker's remaining HP (1) so we don't go negative.
     let expected_instructions = vec![StateInstructions {
         percentage: 100.0,
         instruction_list: vec![
@@ -5557,9 +5561,9 @@ fn test_rockyhelmet_does_not_overkill() {
                 side_ref: SideReference::SideTwo,
                 damage_amount: 48,
             }),
-            Instruction::Heal(HealInstruction {
+            Instruction::Damage(DamageInstruction {
                 side_ref: SideReference::SideOne,
-                heal_amount: -1,
+                damage_amount: 1,
             }),
         ],
     }];
@@ -15309,6 +15313,10 @@ fn test_contact_multi_hit_move_versus_rockyhelmet() {
         Choices::SPLASH,
     );
 
+    // Rocky Helmet now fires per-hit, matching Showdown behavior — a 3-hit
+    // contact move (Surging Strikes) deals 3 * (maxhp/6) = 48 HP recoil to
+    // the attacker, interleaved between damage hits. Previously this fired
+    // once per move, undercounting recoil for multi-hit contact moves.
     let expected_instructions = vec![StateInstructions {
         percentage: 100.0,
         instruction_list: vec![
@@ -15317,16 +15325,24 @@ fn test_contact_multi_hit_move_versus_rockyhelmet() {
                 damage_amount: 21,
             }),
             Instruction::Damage(DamageInstruction {
-                side_ref: SideReference::SideTwo,
-                damage_amount: 21,
+                side_ref: SideReference::SideOne,
+                damage_amount: 16,
             }),
             Instruction::Damage(DamageInstruction {
                 side_ref: SideReference::SideTwo,
                 damage_amount: 21,
             }),
-            Instruction::Heal(HealInstruction {
+            Instruction::Damage(DamageInstruction {
                 side_ref: SideReference::SideOne,
-                heal_amount: -16,
+                damage_amount: 16,
+            }),
+            Instruction::Damage(DamageInstruction {
+                side_ref: SideReference::SideTwo,
+                damage_amount: 21,
+            }),
+            Instruction::Damage(DamageInstruction {
+                side_ref: SideReference::SideOne,
+                damage_amount: 16,
             }),
         ],
     }];
@@ -15488,6 +15504,10 @@ fn test_triple_multihit_move_versus_substitute_and_rockyhelmet() {
         Choices::SPLASH,
     );
 
+    // Substitute absorbs the first two hits (21 + 4 = 25, sub breaks);
+    // only the third hit connects directly with the defender, so Rocky
+    // Helmet only fires once (16 HP recoil) — the per-hit RH check sits
+    // in the non-sub damage branch alongside Iron Barbs / Rough Skin.
     let expected_instructions = vec![StateInstructions {
         percentage: 100.0,
         instruction_list: vec![
@@ -15507,9 +15527,9 @@ fn test_triple_multihit_move_versus_substitute_and_rockyhelmet() {
                 side_ref: SideReference::SideTwo,
                 damage_amount: 21,
             }),
-            Instruction::Heal(HealInstruction {
+            Instruction::Damage(DamageInstruction {
                 side_ref: SideReference::SideOne,
-                heal_amount: -16,
+                damage_amount: 16,
             }),
         ],
     }];
