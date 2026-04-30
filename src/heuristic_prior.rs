@@ -84,7 +84,11 @@ pub fn damage_calc_top_move(state: &State, perspective: SidePerspective) -> Opti
 ///
 /// Lower (more negative) is better — bench resists more than it gets
 /// resisted by. Returns None when:
-///   - The active is force-trapped (switching not legal).
+///   - The static `force_trapped` flag is set on this side. Volatile or
+///     ability-based traps (PARTIALLYTRAPPED, SHADOWTAG, ARENATRAP,
+///     MAGNETPULL) are NOT detected here — `compute()` filters those
+///     downstream by intersecting the pick against the legal `options`
+///     list it receives.
 ///   - No bench Pokemon are alive (last alive).
 fn matchup_score_against(opp: &Pokemon, candidate: &Pokemon) -> f32 {
     let mut incoming: f32 = 0.0;
