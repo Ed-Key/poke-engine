@@ -44,6 +44,25 @@ pub fn damage_calc_top_move(state: &State, perspective: SidePerspective) -> Opti
         SidePerspective::Side2 => (SideReference::SideTwo, state.side_two.get_active_immutable()),
     };
 
+    // Plan I Fix #1.5: figure out if I survive opp's predicted max-damage
+    // attack and what priority that move has. If I outspeed AND/OR have a
+    // higher-priority move, I get to fire regardless of survival; otherwise
+    // I must survive the incoming hit for my move to resolve.
+    let active_idx = match perspective {
+        SidePerspective::Side1 => state.side_one.active_index,
+        SidePerspective::Side2 => state.side_two.active_index,
+    };
+    let (predicted_opp_dmg, opp_priority) =
+        predicted_opp_max_damage_and_priority(state, active_idx, perspective);
+    let i_survive = (active.hp - predicted_opp_dmg) > 0;
+
+    let opp_side_ref = match perspective {
+        SidePerspective::Side1 => SideReference::SideTwo,
+        SidePerspective::Side2 => SideReference::SideOne,
+    };
+    let my_speed = crate::engine::generate_instructions::get_effective_speed(state, &attacking_side);
+    let opp_speed = crate::engine::generate_instructions::get_effective_speed(state, &opp_side_ref);
+
     let mut candidates: Vec<(Choices, i16, f32)> = Vec::new();
     for mv in active.moves.into_iter() {
         if mv.disabled || mv.pp <= 0 {
@@ -57,6 +76,21 @@ pub fn damage_calc_top_move(state: &State, perspective: SidePerspective) -> Opti
             calculate_damage(state, &attacking_side, choice, DamageRolls::Max)
         {
             if max_dmg > 0 {
+                // Priority/speed check: does my move actually fire? If I'd
+                // die first AND I don't outspeed/outprioritize, this move
+                // never resolves — skip it. Speed ties go to opp (strict >).
+                let i_move_first = if choice.priority > opp_priority {
+                    true
+                } else if choice.priority < opp_priority {
+                    false
+                } else {
+                    my_speed > opp_speed
+                };
+                let can_i_fire = i_move_first || i_survive;
+                if !can_i_fire {
+                    continue;
+                }
+
                 let acc = if choice.accuracy < 0.0 { 100.0 } else { choice.accuracy };
                 let score = choice.base_power * (acc / 100.0);
                 candidates.push((mv.id, max_dmg, score));
@@ -178,18 +212,22 @@ fn multi_hit_expected_hits(multi_hit: MultiHitMove) -> f32 {
 }
 
 /// Predict the worst-case damage the opposing active would deal to
-/// `candidate_idx` if our side switched it in. We clone the state,
-/// swap our active to the candidate, then iterate the opp's legal
-/// damaging moves under `DamageRolls::Max`.
+/// `candidate_idx` if our side switched it in, AND the priority of the
+/// move that produced that max damage. We clone the state, swap our
+/// active to the candidate, then iterate the opp's legal damaging
+/// moves under `DamageRolls::Max`.
 ///
 /// Mirrors `damage_calc_top_move`'s filter (skip disabled, no PP,
 /// status, switch). Multi-hit moves are scaled by expected hit count
 /// since `calculate_damage` returns single-hit damage.
-fn predicted_opp_max_damage_against(
+///
+/// Returns `(max_damage, priority_of_that_move)`. When no move deals
+/// damage, returns `(0, 0)`.
+fn predicted_opp_max_damage_and_priority(
     state: &State,
     candidate_idx: PokemonIndex,
     perspective: SidePerspective,
-) -> i16 {
+) -> (i16, i8) {
     let mut sim = state.clone();
     let (my_side_mut, opp_side_ref) = match perspective {
         SidePerspective::Side1 => (&mut sim.side_one, SideReference::SideTwo),
@@ -203,6 +241,7 @@ fn predicted_opp_max_damage_against(
     };
 
     let mut max_dmg: i16 = 0;
+    let mut priority_at_max: i8 = 0;
     for mv in opp.moves.into_iter() {
         if mv.disabled || mv.pp <= 0 {
             continue;
@@ -219,12 +258,23 @@ fn predicted_opp_max_damage_against(
                 let total = (dmg as f32 * hits) as i16;
                 if total > max_dmg {
                     max_dmg = total;
+                    priority_at_max = choice.priority;
                 }
             }
         }
     }
 
-    max_dmg
+    (max_dmg, priority_at_max)
+}
+
+/// Backward-compatible shim for `matchup_switch_pick` — it only needs
+/// damage, not priority. Returns just the damage component.
+pub fn predicted_opp_max_damage_against(
+    state: &State,
+    candidate_idx: PokemonIndex,
+    perspective: SidePerspective,
+) -> i16 {
+    predicted_opp_max_damage_and_priority(state, candidate_idx, perspective).0
 }
 
 /// Survivability-aware switch picker (Plan I, Fix #1).
