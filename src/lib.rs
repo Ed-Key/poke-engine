@@ -17,6 +17,7 @@ pub mod engine;
 
 pub mod choices;
 pub mod eval_kind;
+pub mod heuristic_prior;
 pub mod instruction;
 pub mod io;
 pub mod mcts;
