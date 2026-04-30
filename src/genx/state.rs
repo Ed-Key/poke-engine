@@ -833,6 +833,34 @@ impl Side {
 }
 
 impl State {
+    /// Strip hazard-setter moves whose hazard is already at max stack on
+    /// the opponent's side. The setter would be a no-op, but the heuristic
+    /// eval is symmetric across "click no-op move" and "do nothing", so
+    /// MCTS visits collapse onto the wasted turn (gelks T14: Tyranitar
+    /// clicked SR at 47% while opp Bulk Up'd freely).
+    ///
+    /// Caps: stealth_rock 1, spikes 3, toxic_spikes 2, sticky_web 1.
+    fn filter_redundant_hazards(&self, options: &mut Vec<MoveChoice>, attacker: SideReference) {
+        let (attacker_side, opp_side) = match attacker {
+            SideReference::SideOne => (&self.side_one, &self.side_two),
+            SideReference::SideTwo => (&self.side_two, &self.side_one),
+        };
+        let opp_sc = &opp_side.side_conditions;
+        let active = attacker_side.get_active_immutable();
+        options.retain(|opt| match opt {
+            MoveChoice::Move(idx) | MoveChoice::MoveTera(idx) | MoveChoice::MoveMega(idx) => {
+                match active.moves[idx].id {
+                    Choices::STEALTHROCK if opp_sc.stealth_rock >= 1 => false,
+                    Choices::SPIKES if opp_sc.spikes >= 3 => false,
+                    Choices::TOXICSPIKES if opp_sc.toxic_spikes >= 2 => false,
+                    Choices::STICKYWEB if opp_sc.sticky_web >= 1 => false,
+                    _ => true,
+                }
+            }
+            _ => true,
+        });
+    }
+
     pub fn root_get_all_options(&self) -> (Vec<MoveChoice>, Vec<MoveChoice>) {
         if self.team_preview {
             let mut s1_options = Vec::with_capacity(6);
@@ -906,6 +934,9 @@ impl State {
                 self.side_two.can_use_tera() && !self.tera_banned,
             );
         }
+
+        self.filter_redundant_hazards(&mut s1_options, SideReference::SideOne);
+        self.filter_redundant_hazards(&mut s2_options, SideReference::SideTwo);
 
         if s1_options.len() == 0 {
             s1_options.push(MoveChoice::None);
@@ -1026,6 +1057,9 @@ impl State {
                 self.side_two.add_switches(&mut side_two_options);
             }
         }
+
+        self.filter_redundant_hazards(&mut side_one_options, SideReference::SideOne);
+        self.filter_redundant_hazards(&mut side_two_options, SideReference::SideTwo);
 
         if side_one_options.len() == 0 {
             side_one_options.push(MoveChoice::None);
