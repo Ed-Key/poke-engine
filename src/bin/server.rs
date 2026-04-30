@@ -726,8 +726,11 @@ fn emit_engine_instrument(
             "status_threat_term": round2(breakdown.status_threat_term),
         },
         // Plan I telemetry fields. Default-off path emits 0.0 / null / [].
-        "policy_entropy": round4(policy_entropy(telemetry.raw_nn_probs)),
-        "policy_top1_prob": round4(policy_top1(telemetry.raw_nn_probs)),
+        // Entropy/top1 are computed over the legal-subset policy (what PUCT
+        // actually consumes), not the raw 13-slot vector — slots for fainted
+        // reserves and empty move slots would dilute the signal.
+        "policy_entropy": round4(policy_entropy(&raw_nn_priors_in_options_order)),
+        "policy_top1_prob": round4(policy_top1(&raw_nn_priors_in_options_order)),
         "forced_playouts_triggered": telemetry.forced_playouts_triggered,
         "heuristic_pick_dmg": heuristic_pick_dmg,
         "heuristic_pick_switch": heuristic_pick_switch,
