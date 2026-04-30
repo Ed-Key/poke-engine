@@ -33,14 +33,46 @@
 //! tests in `tests/test_state_encoder.rs` lock down the alphabetical-sort
 //! semantics with explicit fixtures.
 
+use std::collections::HashSet;
+
 use serde_json::{json, Value};
 
-use crate::engine::state::MoveChoice;
+use crate::engine::state::{MoveChoice, PokemonVolatileStatus};
 use crate::nn_client::{Perspective, ACTION_DIM};
 use crate::state::{
     Move, Pokemon, PokemonIndex, PokemonMoveIndex, Side, SideConditions, State, StateTerrain,
     StateTrickRoom, StateWeather,
 };
+
+/// Policy-relevant volatile statuses we forward to the sidecar / NN policy.
+///
+/// The engine tracks ~80 volatile statuses but most are bookkeeping (FLINCH,
+/// ROOST, FOCUSENERGY, single-turn typing flags, etc.) that would just add
+/// noise to the policy input. This list mirrors the spec in the Plan I Fix #4
+/// plan doc and the test fixtures in
+/// `tests/test_nn_state_encoder_extensions.rs`.
+const POLICY_RELEVANT_VOLATILES: &[PokemonVolatileStatus] = &[
+    PokemonVolatileStatus::CONFUSION,
+    PokemonVolatileStatus::LEECHSEED,
+    PokemonVolatileStatus::SUBSTITUTE,
+    PokemonVolatileStatus::LOCKEDMOVE,
+    PokemonVolatileStatus::ENCORE,
+    PokemonVolatileStatus::TAUNT,
+    PokemonVolatileStatus::YAWN,
+];
+
+/// Filter `volatile_statuses` to the policy-relevant subset and emit them as
+/// `Debug`-formatted strings (e.g. `"CONFUSION"`, `"LEECHSEED"`). Mirrors the
+/// `BattleRequest.volatileStatuses` shape on the sidecar side.
+fn encode_volatile_statuses(volatiles: &HashSet<PokemonVolatileStatus>) -> Vec<Value> {
+    let mut out = Vec::new();
+    for v in POLICY_RELEVANT_VOLATILES {
+        if volatiles.contains(v) {
+            out.push(Value::String(format!("{:?}", v)));
+        }
+    }
+    out
+}
 
 /// Engine-internal side selector. Mirrors the search-loop's side enumeration
 /// for the encoder's "whose perspective is this from?" arg.
@@ -103,6 +135,7 @@ pub fn encode(state: &State, _perspective: SidePerspective) -> Value {
 
 fn encode_side(side: &Side) -> Value {
     let active_idx = pokemon_index_to_usize(side.active_index);
+    let active_volatiles = encode_volatile_statuses(&side.volatile_statuses);
     let mut pkmn_arr: Vec<Value> = Vec::with_capacity(6);
     for (slot, p) in side.pokemon.into_iter().enumerate() {
         // Per-mon boosts: only the active mon has them (side-level boosts in
@@ -113,7 +146,15 @@ fn encode_side(side: &Side) -> Value {
         } else {
             json!({})
         };
-        pkmn_arr.push(encode_pokemon(p, boosts));
+        // Volatile statuses live on `Side` (not `Pokemon`) and only apply to
+        // the currently-active mon. Reserves get `[]` so the schema is
+        // stable across slots / turns.
+        let volatiles = if slot == active_idx {
+            active_volatiles.clone()
+        } else {
+            Vec::new()
+        };
+        pkmn_arr.push(encode_pokemon(p, boosts, volatiles));
     }
     json!({
         "pokemon": pkmn_arr,
@@ -122,10 +163,11 @@ fn encode_side(side: &Side) -> Value {
         "boosts": encode_side_level_boosts(side),
         "forceTrapped": side.force_trapped,
         "forceSwitch": side.force_switch,
+        "lastUsedMove": side.last_used_move.serialize(),
     })
 }
 
-fn encode_pokemon(p: &Pokemon, boosts: Value) -> Value {
+fn encode_pokemon(p: &Pokemon, boosts: Value, volatile_statuses: Vec<Value>) -> Value {
     let species_lc = format!("{:?}", p.id).to_lowercase();
     let type1 = format!("{:?}", p.types.0).to_lowercase();
     let type2 = format!("{:?}", p.types.1).to_lowercase();
@@ -175,6 +217,7 @@ fn encode_pokemon(p: &Pokemon, boosts: Value) -> Value {
         "terastallized": p.terastallized,
         "teraType": tera_type,
         "boosts": boosts,
+        "volatileStatuses": Value::Array(volatile_statuses),
     })
 }
 
