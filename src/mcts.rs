@@ -101,7 +101,35 @@ impl Node {
         choice
     }
 
-    pub unsafe fn selection(&mut self, state: &mut State, c_puct: f32) -> (*mut Node, usize, usize) {
+    /// Plan I (KataGo Forced Playouts): at the ROOT only, before falling back
+    /// to PUCT-max, scan children in deterministic order and return the first
+    /// one whose visit count is below its forced-playout threshold
+    /// `floor(sqrt(c_forced * P * N_parent))`. With `c_forced == 0.0` the
+    /// short-circuit in `MoveNode::should_force_visit` ensures this method
+    /// returns the same index as `maximize_puct_for_side` — bit-identical
+    /// to today's behavior.
+    pub fn maximize_with_forced_playouts(
+        &self,
+        side_map: &[MoveNode],
+        c_puct: f32,
+        c_forced: f32,
+    ) -> usize {
+        if c_forced > 0.0 {
+            for (index, node) in side_map.iter().enumerate() {
+                if node.should_force_visit(self.times_visited, c_forced) {
+                    return index;
+                }
+            }
+        }
+        self.maximize_puct_for_side(side_map, c_puct)
+    }
+
+    pub unsafe fn selection(
+        &mut self,
+        state: &mut State,
+        c_puct: f32,
+        c_forced: f32,
+    ) -> (*mut Node, usize, usize) {
         let return_node = self as *mut Node;
         if self.s1_options.is_none() {
             let (s1_options, s2_options) = state.get_all_options();
@@ -110,15 +138,34 @@ impl Node {
             self.populate(s1_options, s2_options, None, None);
         }
 
-        let s1_mc_index = self.maximize_puct_for_side(&self.s1_options.as_ref().unwrap(), c_puct);
-        let s2_mc_index = self.maximize_puct_for_side(&self.s2_options.as_ref().unwrap(), c_puct);
+        // Plan I: forced playouts apply at ROOT only. In-tree selection uses
+        // pure PUCT — pass c_forced=0.0 down so should_force_visit short-circuits.
+        let (s1_mc_index, s2_mc_index) = if self.root {
+            (
+                self.maximize_with_forced_playouts(
+                    self.s1_options.as_ref().unwrap(),
+                    c_puct,
+                    c_forced,
+                ),
+                self.maximize_with_forced_playouts(
+                    self.s2_options.as_ref().unwrap(),
+                    c_puct,
+                    c_forced,
+                ),
+            )
+        } else {
+            (
+                self.maximize_puct_for_side(self.s1_options.as_ref().unwrap(), c_puct),
+                self.maximize_puct_for_side(self.s2_options.as_ref().unwrap(), c_puct),
+            )
+        };
         let child_vector = self.children.get_mut(&(s1_mc_index, s2_mc_index));
         match child_vector {
             Some(child_vector) => {
                 let child_vec_ptr = child_vector as *mut Vec<Node>;
                 let chosen_child = self.sample_node(child_vec_ptr);
                 state.apply_instructions(&(*chosen_child).instructions.instruction_list);
-                (*chosen_child).selection(state, c_puct)
+                (*chosen_child).selection(state, c_puct, c_forced)
             }
             None => (return_node, s1_mc_index, s2_mc_index),
         }
@@ -293,8 +340,15 @@ pub struct MctsResult {
     pub principal_variation: Vec<PrincipalVariationStep>,
 }
 
-fn do_mcts(root_node: &mut Node, state: &mut State, root_eval: &f32, c_puct: f32) {
-    let (mut new_node, s1_move, s2_move) = unsafe { root_node.selection(state, c_puct) };
+fn do_mcts(
+    root_node: &mut Node,
+    state: &mut State,
+    root_eval: &f32,
+    c_puct: f32,
+    c_forced: f32,
+) {
+    let (mut new_node, s1_move, s2_move) =
+        unsafe { root_node.selection(state, c_puct, c_forced) };
     new_node = unsafe { (*new_node).expand(state, s1_move, s2_move) };
     let rollout_result = unsafe { (*new_node).rollout(state, root_eval) };
     unsafe { (*new_node).backpropagate(rollout_result, state) }
@@ -399,6 +453,10 @@ pub struct MctsSearch {
     state: State,
     root_eval: f32,
     c_puct: f32,
+    /// Plan I KataGo Forced Playouts constant. 0.0 disables; 2.0 is
+    /// KataGo's published default. Used at root selection only —
+    /// in-tree selection (depth >= 1) ignores this.
+    pub c_forced: f32,
 }
 
 impl MctsSearch {
@@ -496,7 +554,17 @@ impl MctsSearch {
             state,
             root_eval,
             c_puct,
+            // Plan I: forced-playouts disabled by default. Existing tests
+            // and CLI behavior are bit-identical until set_c_forced is called.
+            c_forced: 0.0,
         }
+    }
+
+    /// Plan I: set the KataGo forced-playouts constant. Clamped to >= 0.
+    /// 0.0 disables; 2.0 is KataGo's published default. Only consulted at
+    /// the ROOT — in-tree selection ignores this value.
+    pub fn set_c_forced(&mut self, c: f32) {
+        self.c_forced = c.max(0.0);
     }
 
     /// Run MCTS for up to `budget` of wall-clock time. Returns the number of
@@ -510,7 +578,13 @@ impl MctsSearch {
         let iterations_before = self.root.times_visited;
         while start_time.elapsed() < budget {
             for _ in 0..MCTS_BATCH_SIZE {
-                do_mcts(&mut self.root, &mut self.state, &self.root_eval, self.c_puct);
+                do_mcts(
+                    &mut self.root,
+                    &mut self.state,
+                    &self.root_eval,
+                    self.c_puct,
+                    self.c_forced,
+                );
             }
 
             // Cut off after 10 million iterations
