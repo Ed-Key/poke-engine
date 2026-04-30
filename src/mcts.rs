@@ -243,6 +243,23 @@ impl MoveNode {
         let score = self.total_score / self.visits as f32;
         score
     }
+
+    /// KataGo Forced Playouts predicate (Wu 2019, AAAI-RLG).
+    ///
+    /// Returns true if this child has fewer visits than the
+    /// forced-playouts threshold:
+    ///
+    ///   n_forced = floor(sqrt(c_forced * prior * n_parent))
+    ///
+    /// When `c_forced == 0.0`, never returns true (short-circuit for
+    /// the default-off CLI flag).
+    pub fn should_force_visit(&self, n_parent: u32, c_forced: f32) -> bool {
+        if c_forced <= 0.0 {
+            return false;
+        }
+        let threshold = (c_forced * self.prior * n_parent as f32).sqrt().floor() as u32;
+        self.visits < threshold
+    }
 }
 
 #[derive(Clone)]

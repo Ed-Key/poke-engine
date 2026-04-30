@@ -89,3 +89,26 @@ fn c_puct_scales_exploration_proportionally() {
     let ratio = u_high / u_low;
     assert!((ratio - 8.0).abs() < 1e-3, "ratio = {}", ratio);
 }
+
+/// P=0.05, c_forced=2.0, N_parent=8M
+/// n_forced = floor(sqrt(2 * 0.05 * 8_000_000)) = floor(sqrt(800_000)) = 894
+/// With N=10, 10 < 894 → true.
+#[test]
+fn should_force_visit_below_threshold_returns_true() {
+    let node = mk(10, 5.0, 0.05);
+    assert!(node.should_force_visit(8_000_000, 2.0));
+}
+
+#[test]
+fn should_force_visit_above_threshold_returns_false() {
+    // Same parameters but N=900 > 894 → false.
+    let node = mk(900, 450.0, 0.05);
+    assert!(!node.should_force_visit(8_000_000, 2.0));
+}
+
+#[test]
+fn should_force_visit_c_zero_short_circuits() {
+    // c_forced = 0.0 → n_forced = 0 always → never force-visit.
+    let node = mk(0, 0.0, 0.05);
+    assert!(!node.should_force_visit(8_000_000, 0.0));
+}
