@@ -351,6 +351,16 @@ impl Pokemon {
                             && &iter.pokemon_move_index == last_used_move
                         {
                             continue;
+                        } else if self.moves[&iter.pokemon_move_index].id == Choices::FAKEOUT
+                            || self.moves[&iter.pokemon_move_index].id == Choices::FIRSTIMPRESSION
+                        {
+                            // Showdown rule: failwhenusedasfirstturn — Fake Out and First
+                            // Impression only succeed on the Pokemon's first turn after
+                            // switching in. Once any prior move has been used (LastUsedMove
+                            // is Move(_)), they are illegal. The Switch(_) and None arms
+                            // already fall through to legal-add, so first-turn-out and
+                            // battle-start cases are preserved.
+                            continue;
                         }
                     }
                     _ => {
