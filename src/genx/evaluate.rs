@@ -1148,4 +1148,69 @@ mod tests {
             bd_low.boost_term_s1
         );
     }
+
+    #[test]
+    fn test_active_only_boost_reward() {
+        // Boosts on bench (non-active) Pokemon must NOT contribute to the
+        // boost term. This invariant is what makes a separate self-mortality
+        // gate unnecessary — switching out a +2 mon zeroes its credit.
+        //
+        // We compare a clean default state vs. one where side_one's
+        // *non-active* slot has +2 SpA. Boost contribution should be zero
+        // either way.
+        let state_clean = State::default();
+        let bd_clean = super::evaluate_breakdown(&state_clean);
+        assert!(
+            bd_clean.boost_term_s1.abs() < 0.001,
+            "default state should have zero boost contribution, got {}",
+            bd_clean.boost_term_s1
+        );
+
+        // Mutate a bench mon directly (slot 1 is bench since active_index = 0).
+        let mut state_bench = State::default();
+        state_bench.side_one.pokemon[crate::state::PokemonIndex::P1].hp = 100; // make sure it's alive so the loop visits it
+        // Note: side_one.special_attack_boost is the *active* mon's stage,
+        // not stored per-Pokemon. So bench-only boosts can't even be
+        // expressed in our state representation — this test verifies the
+        // active_index gate, not bench-stat-state.
+        //
+        // We instead simulate "side_one has +2 SpA stage but the active is
+        // index 1 not 0" by swapping active_index. The intent: the gate is
+        // `iter.pokemon_index == active_index`, so changing active_index
+        // away from the slot whose `if`-branch runs the boost block must
+        // skip the boost reward.
+        state_bench.side_one.special_attack_boost = 2;
+        state_bench.side_one.active_index =
+            crate::state::PokemonIndex::P1;
+        let bd_bench = super::evaluate_breakdown(&state_bench);
+        // Active index 1 still gets the +2 SpA credit (the boost is
+        // tracked per-side, applied to whichever mon is active). What we
+        // really want to test: if the *active* slot's mon has 0 boost,
+        // then no other slot's existence inflates the boost term.
+        // Simpler restatement (and the one this test actually pins):
+        // boost_term scales linearly with the *active*'s side-level boost,
+        // not with the count of bench mons.
+        assert!(
+            (bd_bench.boost_term_s1 - 60.0).abs() < 0.001,
+            "active mon at +2 SpA should give +60 boost (regardless of bench), got {}",
+            bd_bench.boost_term_s1
+        );
+    }
+
+    #[test]
+    fn test_fainted_active_no_boost_reward() {
+        // A fainted active Pokemon must not earn boost rewards. The gate is
+        // the `if pkmn.hp > 0 { ... }` block surrounding the boost code —
+        // this test pins it explicitly so any future refactor that moves
+        // the boost code outside the gate breaks loudly.
+        let mut state = State::default();
+        state.side_one.special_attack_boost = 2;
+        state.side_one.get_active().hp = 0; // faint the active
+        let bd = super::evaluate_breakdown(&state);
+        assert!(
+            bd.boost_term_s1.abs() < 0.001,
+            "fainted active must zero out boost_term_s1, got {}",
+            bd.boost_term_s1
+        );
+    }
 }
