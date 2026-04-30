@@ -34,13 +34,9 @@ pub struct HeuristicPrior {
 ///   - All damaging moves do 0 damage (immunity).
 ///   - The active has no moves at all.
 pub fn damage_calc_top_move(state: &State, perspective: SidePerspective) -> Option<Choices> {
-    let attacking_side = match perspective {
-        SidePerspective::Side1 => SideReference::SideOne,
-        SidePerspective::Side2 => SideReference::SideTwo,
-    };
-    let active = match perspective {
-        SidePerspective::Side1 => state.side_one.get_active_immutable(),
-        SidePerspective::Side2 => state.side_two.get_active_immutable(),
+    let (attacking_side, active) = match perspective {
+        SidePerspective::Side1 => (SideReference::SideOne, state.side_one.get_active_immutable()),
+        SidePerspective::Side2 => (SideReference::SideTwo, state.side_two.get_active_immutable()),
     };
 
     let mut candidates: Vec<(Choices, i16, f32)> = Vec::new();
@@ -52,11 +48,11 @@ pub fn damage_calc_top_move(state: &State, perspective: SidePerspective) -> Opti
         if choice.category == MoveCategory::Status || choice.category == MoveCategory::Switch {
             continue;
         }
-        if let Some((_, max_dmg)) =
+        if let Some((max_dmg, _crit)) =
             calculate_damage(state, &attacking_side, choice, DamageRolls::Max)
         {
             if max_dmg > 0 {
-                let acc = choice.accuracy;
+                let acc = if choice.accuracy < 0.0 { 100.0 } else { choice.accuracy };
                 let score = choice.base_power * (acc / 100.0);
                 candidates.push((mv.id, max_dmg, score));
             }
