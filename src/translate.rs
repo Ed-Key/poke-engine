@@ -62,6 +62,35 @@ pub struct SideInput {
     /// are usable. Engine reads via `Side.last_used_move` (state.rs:1010).
     #[serde(default)]
     pub last_used_move: Option<String>,
+    /// Per-volatile turn counters that the engine increments/decrements
+    /// during simulation. When a volatile is set without a sane companion
+    /// counter the engine panics (e.g. genx/generate_instructions.rs:2129
+    /// "Taunt duration cannot be 0 when taunt volatile is active"). The
+    /// engine reads via `Side.volatile_status_durations` (state.rs:995).
+    #[serde(default)]
+    pub volatile_status_durations: Option<VolatileStatusDurationsInput>,
+}
+
+/// Per-volatile turn counters. Match the fields on the engine's
+/// `VolatileStatusDurations` struct (state.rs:723). Some count UP from
+/// 0 toward a removal threshold (taunt/yawn/encore/lockedmove), others
+/// count DOWN to 0 (slowstart). Confusion is incremented as the engine
+/// rolls self-hits.
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct VolatileStatusDurationsInput {
+    #[serde(default)]
+    pub confusion: i8,
+    #[serde(default)]
+    pub encore: i8,
+    #[serde(default)]
+    pub lockedmove: i8,
+    #[serde(default)]
+    pub slowstart: i8,
+    #[serde(default)]
+    pub taunt: i8,
+    #[serde(default)]
+    pub yawn: i8,
 }
 
 #[derive(Debug, Deserialize)]
@@ -458,6 +487,7 @@ fn fabric_aux_side_to_input(side: &FabricAuxSide) -> SideInput {
         force_switch: false,
         substitute_health: None,
         last_used_move: None,
+        volatile_status_durations: None,
     }
 }
 
@@ -478,6 +508,7 @@ pub fn from_fabric_aux(state: &FabricAuxState) -> State {
             force_switch: false,
             substitute_health: None,
             last_used_move: None,
+            volatile_status_durations: None,
         }
     };
 
@@ -494,6 +525,7 @@ pub fn from_fabric_aux(state: &FabricAuxState) -> State {
             force_switch: false,
             substitute_health: None,
             last_used_move: None,
+            volatile_status_durations: None,
         }
     };
 
@@ -741,8 +773,17 @@ fn serialize_side(side: &SideInput) -> String {
         _ => String::new(),
     };
 
-    // Volatile status durations (defaults: all zeros)
-    let volatile_durations = "0;0;0;0;0;0";
+    // Volatile status durations — order MUST match engine's
+    // VolatileStatusDurations::serialize: confusion;encore;lockedmove;
+    // slowstart;taunt;yawn (state.rs:769-774). Defaults to all zeros
+    // when the proxy doesn't supply them.
+    let volatile_durations = match &side.volatile_status_durations {
+        Some(d) => format!(
+            "{};{};{};{};{};{}",
+            d.confusion, d.encore, d.lockedmove, d.slowstart, d.taunt, d.yawn,
+        ),
+        None => "0;0;0;0;0;0".to_string(),
+    };
 
     // Boosts
     let (atk_b, def_b, spa_b, spd_b, spe_b, acc_b, eva_b) = match &side.boosts {
