@@ -777,6 +777,13 @@ async fn analyze_stream_handler(
     let raw_json = body;
     let eval_kind = app.eval_kind.clone();
     let c_puct = app.c_puct;
+    // Plan I (Task 8b): mirror analyze_handler — capture mix/mass/forced-playouts
+    // knobs by-value (all f32, Copy) so the blocking thread below can apply the
+    // blended-prior + forced-playouts wiring on this streaming path too.
+    let heuristic_prior_mix = app.heuristic_prior_mix;
+    let forced_playouts_c = app.forced_playouts_c;
+    let heuristic_prior_mass_dmg = app.heuristic_prior_mass_dmg;
+    let heuristic_prior_mass_switch = app.heuristic_prior_mass_switch;
 
     // Channel between the blocking search thread and the async streaming
     // response body. Buffer 32 is enough for ~30s of updates at 1 Hz.
@@ -916,16 +923,84 @@ async fn analyze_stream_handler(
             .map(|mc| mc.to_string(&state.side_two))
             .collect();
         let pre_search_breakdown = evaluate_breakdown(&state);
+        // Plan I (Task 8b telemetry): keep state + s1_options snapshots for
+        // the populated [ENGINE-INSTRUMENT] line on the blended path. Mirrors
+        // analyze_handler's `state_for_telemetry` / `s1_options_for_telemetry`.
+        let state_for_telemetry = state.clone();
+        let s1_options_for_telemetry: Vec<poke_engine::engine::state::MoveChoice> =
+            s1_options.clone();
 
+        // Plan I (Task 8b): when blending is requested AND we're in NN mode,
+        // fetch the raw NN policy ourselves, blend with the heuristic prior,
+        // and pass through `new_with_priors`. Otherwise fall through to the
+        // original `new_with_eval` path. Mirrors analyze_handler exactly.
+        let use_blended = heuristic_prior_mix > 0.0 && eval_kind.uses_nn();
+        let mut telemetry_raw_nn_probs: Vec<f32> = Vec::new();
+        let mut telemetry_heuristic: Option<poke_engine::heuristic_prior::HeuristicPrior> = None;
+        let mut telemetry_s1_priors_blended: Vec<f32> = Vec::new();
         // MctsSearch owns the State. Cloning is cheap relative to a
         // multi-second MCTS run.
-        let mut search = MctsSearch::new_with_eval(
-            state.clone(),
-            s1_options,
-            s2_options,
-            &eval_kind,
-            c_puct,
-        );
+        let mut search = if use_blended {
+            // SAFETY of unwrap: `uses_nn()` guarantees the EvalKind::Nn arm.
+            let client = match &eval_kind {
+                poke_engine::eval_kind::EvalKind::Nn(c) => c.clone(),
+                _ => unreachable!("guarded by uses_nn() above"),
+            };
+            let heuristic = poke_engine::heuristic_prior::compute(
+                &state,
+                poke_engine::nn_state_encoder::SidePerspective::Side1,
+                &s1_options,
+                heuristic_prior_mass_dmg,
+                heuristic_prior_mass_switch,
+            );
+            let s1_priors_blended = {
+                let json = poke_engine::nn_state_encoder::encode(
+                    &state,
+                    poke_engine::nn_state_encoder::SidePerspective::Side1,
+                );
+                match client.policy(&json, poke_engine::nn_client::Perspective::P1) {
+                    Ok(resp) => {
+                        telemetry_raw_nn_probs = resp.probs.clone();
+                        let blended = poke_engine::nn_state_encoder::map_policy_to_options_blended(
+                            &resp.probs,
+                            &state,
+                            poke_engine::nn_state_encoder::SidePerspective::Side1,
+                            &s1_options,
+                            heuristic.as_ref(),
+                            heuristic_prior_mix,
+                        );
+                        telemetry_s1_priors_blended = blended.clone();
+                        Some(blended)
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "NN client failed at root (Plan I blended path, stream): {} — falling back to uniform priors",
+                            e
+                        );
+                        None
+                    }
+                }
+            };
+            telemetry_heuristic = heuristic;
+            MctsSearch::new_with_priors(
+                state.clone(),
+                s1_options,
+                s2_options,
+                c_puct,
+                s1_priors_blended,
+                None,
+            )
+        } else {
+            MctsSearch::new_with_eval(
+                state.clone(),
+                s1_options,
+                s2_options,
+                &eval_kind,
+                c_puct,
+            )
+        };
+        // Plan I: forced-playouts root constant. 0.0 (default) is a no-op.
+        search.set_c_forced(forced_playouts_c);
         let start = Instant::now();
         let time_limit = Duration::from_millis(time_limit_ms);
         let interval = Duration::from_millis(update_interval_ms);
@@ -951,18 +1026,24 @@ async fn analyze_stream_handler(
         // Final snapshot.
         let snap = search.snapshot(start.elapsed().as_millis() as u64);
         // [ENGINE-INSTRUMENT] structured log: emit ONE JSON line per request
-        // capturing the root eval breakdown + top-K MCTS branches. This is the
-        // hook the analyst greps for to debug "why did the engine pick X?".
-        // Streaming path doesn't (yet) thread Plan I blending — pass empty
-        // telemetry but propagate the search's forced-playouts counter so the
-        // field is meaningful even when c_forced > 0 in this path.
+        // capturing the root eval breakdown + top-K MCTS branches. Plan I
+        // (Task 8b) — telemetry is now populated when the blended path ran;
+        // empty captures + the search's forced-playouts counter otherwise.
+        let telemetry = InstrumentTelemetry {
+            raw_nn_probs: &telemetry_raw_nn_probs,
+            heuristic: telemetry_heuristic.as_ref(),
+            s1_priors_blended: &telemetry_s1_priors_blended,
+            forced_playouts_triggered: search.forced_playouts_triggered,
+            state: Some(&state_for_telemetry),
+            s1_options: &s1_options_for_telemetry,
+        };
         emit_engine_instrument(
             &pre_search_breakdown,
             &snap,
             &s1_move_names,
             &s2_move_names,
             "single",
-            &InstrumentTelemetry::empty(search.forced_playouts_triggered),
+            &telemetry,
         );
         let final_update = build_stream_update("final", &snap, &s1_move_names);
         let _ = emit(&tx, &final_update);
