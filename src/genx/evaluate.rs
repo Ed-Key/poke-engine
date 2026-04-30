@@ -38,29 +38,6 @@ const POKEMON_BOOST_MULTIPLIER_NEG_4: f32 = -3.0;
 const POKEMON_BOOST_MULTIPLIER_NEG_5: f32 = -3.15;
 const POKEMON_BOOST_MULTIPLIER_NEG_6: f32 = -3.3;
 
-/// Bracketed HP-aware multiplier for the active Pokemon's boost rewards,
-/// inspired by Metamon Kaizo's setup schedule
-/// (metamon/baselines/heuristic/kaizo.py:185-228). Replaces the previous
-/// linear `hp/maxhp` multiplier, which still gave 54% credit at 54% HP and
-/// caused the engine to recommend setup (DD, Nasty Plot, etc.) into known
-/// KO threats.
-///
-/// Step function:
-///   HP > 70%  → full reward (Kaizo "neutral")
-///   40-70%    → zero (Kaizo would apply -2; cleanest map to our scale)
-///   < 40%     → slightly negative (actually penalize setup at low HP)
-#[allow(dead_code)] // removed from production callers in Fix #2.5; kaizo tests below pin old behavior; both removed in Task 5
-fn boost_hp_multiplier(hp: i16, maxhp: i16) -> f32 {
-    let pct = (hp as f32) / (maxhp as f32).max(1.0);
-    if pct > 0.70 {
-        1.0
-    } else if pct >= 0.40 {
-        0.0
-    } else {
-        -0.5
-    }
-}
-
 const POKEMON_FROZEN: f32 = -40.0;
 const POKEMON_ASLEEP: f32 = -25.0;
 const POKEMON_PARALYZED: f32 = -25.0;
@@ -1055,76 +1032,6 @@ mod tests {
         // Score is deterministic.
         let score_again = super::evaluate(&state);
         assert_eq!(score_baseline, score_again, "evaluate must be deterministic");
-    }
-
-    #[test]
-    fn test_boost_hp_multiplier_kaizo_brackets() {
-        // Direct unit test of the bracketed schedule itself.
-        // > 70% HP → full reward
-        assert_eq!(super::boost_hp_multiplier(100, 100), 1.0);
-        assert_eq!(super::boost_hp_multiplier(80, 100), 1.0);
-        assert_eq!(super::boost_hp_multiplier(71, 100), 1.0);
-        // 40-70% HP → zero reward (the load-bearing change)
-        assert_eq!(super::boost_hp_multiplier(70, 100), 0.0);
-        assert_eq!(super::boost_hp_multiplier(54, 100), 0.0); // Dragonite-DD scenario
-        assert_eq!(super::boost_hp_multiplier(40, 100), 0.0);
-        // < 40% HP → negative reward (penalize setup)
-        assert_eq!(super::boost_hp_multiplier(39, 100), -0.5);
-        assert_eq!(super::boost_hp_multiplier(1, 100), -0.5);
-    }
-
-    #[test]
-    fn test_boost_term_kaizo_schedule_in_breakdown() {
-        // Build a state with side_one's active at +2 SpA, vary HP across the
-        // three Kaizo brackets, and confirm the boost_term_s1 magnitude flips
-        // as expected. Also verify the evaluate <=> evaluate_breakdown
-        // invariant still holds at each HP point.
-
-        // At +2 stage, get_boost_multiplier returns POKEMON_BOOST_MULTIPLIER_2 = 2.0,
-        // so the SpA contribution is 2.0 * 30.0 * multiplier = 60 * multiplier.
-
-        // Case 1: 100% HP (full credit) → boost_term_s1 ~= +60
-        let mut state_full = State::default();
-        state_full.side_one.special_attack_boost = 2;
-        let bd_full = super::evaluate_breakdown(&state_full);
-        assert!(
-            (bd_full.boost_term_s1 - 60.0).abs() < 0.001,
-            "100% HP: boost_term_s1 should be ~+60, got {}",
-            bd_full.boost_term_s1
-        );
-        let diff_full = (super::evaluate(&state_full) - bd_full.total).abs();
-        assert!(diff_full < 0.001, "invariant broken at 100% HP: diff={}", diff_full);
-
-        // Case 2: 50% HP (Kaizo marginal band) → boost_term_s1 == 0
-        let mut state_mid = State::default();
-        state_mid.side_one.special_attack_boost = 2;
-        state_mid.side_one.get_active().hp = 50;
-        let bd_mid = super::evaluate_breakdown(&state_mid);
-        assert!(
-            bd_mid.boost_term_s1.abs() < 0.001,
-            "50% HP: boost_term_s1 should be ~0 (Kaizo zero-out), got {}",
-            bd_mid.boost_term_s1
-        );
-        let diff_mid = (super::evaluate(&state_mid) - bd_mid.total).abs();
-        assert!(diff_mid < 0.001, "invariant broken at 50% HP: diff={}", diff_mid);
-
-        // Case 3: 30% HP (dangerous) → boost_term_s1 < 0 (~-30 from -0.5 × 60)
-        let mut state_low = State::default();
-        state_low.side_one.special_attack_boost = 2;
-        state_low.side_one.get_active().hp = 30;
-        let bd_low = super::evaluate_breakdown(&state_low);
-        assert!(
-            bd_low.boost_term_s1 < 0.0,
-            "30% HP: boost_term_s1 should be negative, got {}",
-            bd_low.boost_term_s1
-        );
-        assert!(
-            (bd_low.boost_term_s1 - (-30.0)).abs() < 0.001,
-            "30% HP: boost_term_s1 should be ~-30 (-0.5 × 60), got {}",
-            bd_low.boost_term_s1
-        );
-        let diff_low = (super::evaluate(&state_low) - bd_low.total).abs();
-        assert!(diff_low < 0.001, "invariant broken at 30% HP: diff={}", diff_low);
     }
 
     #[test]
