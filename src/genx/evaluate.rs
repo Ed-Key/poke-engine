@@ -45,6 +45,7 @@ const POKEMON_BOOST_MULTIPLIER_NEG_6: f32 = -3.3;
 ///   HP > 70%  → full reward (Kaizo "neutral")
 ///   40-70%    → zero (Kaizo would apply -2; cleanest map to our scale)
 ///   < 40%     → slightly negative (actually penalize setup at low HP)
+#[allow(dead_code)] // removed from production callers in Fix #2.5; kaizo tests below pin old behavior; both removed in Task 5
 fn boost_hp_multiplier(hp: i16, maxhp: i16) -> f32 {
     let pct = (hp as f32) / (maxhp as f32).max(1.0);
     if pct > 0.70 {
@@ -426,20 +427,18 @@ pub fn evaluate(state: &State) -> f32 {
                     }
                 }
 
-                // HP-aware setup penalty (Kaizo bracketed schedule): a +2 boost
-                // is only valuable if the boosted Pokemon survives to deploy it.
-                // The previous linear `hp/maxhp` scaling still credited setup at
-                // 54% HP (Dragonite DD into a known KO). The bracketed step
-                // function hard-zeros the reward in the 40-70% band and
-                // negatively scores setup below 40%.
-                let s1_hp_ratio = boost_hp_multiplier(pkmn.hp, pkmn.maxhp);
-                score += get_boost_multiplier(state.side_one.attack_boost) * POKEMON_ATTACK_BOOST * s1_hp_ratio;
-                score += get_boost_multiplier(state.side_one.defense_boost) * POKEMON_DEFENSE_BOOST * s1_hp_ratio;
+                // Flat boost reward (foul-play parity). HP-conditional gating
+                // was removed in Fix #2.5: it double-counted with threat_score
+                // × 40 and produced a 40-70% HP blind zone for setup sweepers.
+                // Self-mortality is naturally handled by the active+alive gate
+                // on the enclosing `if iter.pokemon_index == ...` block.
+                score += get_boost_multiplier(state.side_one.attack_boost) * POKEMON_ATTACK_BOOST;
+                score += get_boost_multiplier(state.side_one.defense_boost) * POKEMON_DEFENSE_BOOST;
                 score += get_boost_multiplier(state.side_one.special_attack_boost)
-                    * POKEMON_SPECIAL_ATTACK_BOOST * s1_hp_ratio;
+                    * POKEMON_SPECIAL_ATTACK_BOOST;
                 score += get_boost_multiplier(state.side_one.special_defense_boost)
-                    * POKEMON_SPECIAL_DEFENSE_BOOST * s1_hp_ratio;
-                score += get_boost_multiplier(state.side_one.speed_boost) * POKEMON_SPEED_BOOST * s1_hp_ratio;
+                    * POKEMON_SPECIAL_DEFENSE_BOOST;
+                score += get_boost_multiplier(state.side_one.speed_boost) * POKEMON_SPEED_BOOST;
                 score += threat_score(state, &SideReference::SideOne) * THREAT_SCORE_WEIGHT;
                 score -= mortality_score(state, &SideReference::SideOne) * MORTALITY_SCORE_WEIGHT;
                 score += status_threat_score(state, &SideReference::SideOne) * STATUS_THREAT_WEIGHT;
@@ -469,16 +468,14 @@ pub fn evaluate(state: &State) -> f32 {
                     }
                 }
 
-                // HP-aware setup penalty (mirror of side_one): Kaizo bracketed
-                // schedule, see boost_hp_multiplier docs.
-                let s2_hp_ratio = boost_hp_multiplier(pkmn.hp, pkmn.maxhp);
-                score -= get_boost_multiplier(state.side_two.attack_boost) * POKEMON_ATTACK_BOOST * s2_hp_ratio;
-                score -= get_boost_multiplier(state.side_two.defense_boost) * POKEMON_DEFENSE_BOOST * s2_hp_ratio;
+                // Flat boost reward (foul-play parity). See s1 block for rationale.
+                score -= get_boost_multiplier(state.side_two.attack_boost) * POKEMON_ATTACK_BOOST;
+                score -= get_boost_multiplier(state.side_two.defense_boost) * POKEMON_DEFENSE_BOOST;
                 score -= get_boost_multiplier(state.side_two.special_attack_boost)
-                    * POKEMON_SPECIAL_ATTACK_BOOST * s2_hp_ratio;
+                    * POKEMON_SPECIAL_ATTACK_BOOST;
                 score -= get_boost_multiplier(state.side_two.special_defense_boost)
-                    * POKEMON_SPECIAL_DEFENSE_BOOST * s2_hp_ratio;
-                score -= get_boost_multiplier(state.side_two.speed_boost) * POKEMON_SPEED_BOOST * s2_hp_ratio;
+                    * POKEMON_SPECIAL_DEFENSE_BOOST;
+                score -= get_boost_multiplier(state.side_two.speed_boost) * POKEMON_SPEED_BOOST;
                 score -= threat_score(state, &SideReference::SideTwo) * THREAT_SCORE_WEIGHT;
                 score += mortality_score(state, &SideReference::SideTwo) * MORTALITY_SCORE_WEIGHT;
                 score -= status_threat_score(state, &SideReference::SideTwo) * STATUS_THREAT_WEIGHT;
@@ -578,14 +575,13 @@ pub fn evaluate_breakdown(state: &State) -> EvalBreakdown {
                         _ => {}
                     }
                 }
-                let s1_hp_ratio = boost_hp_multiplier(pkmn.hp, pkmn.maxhp);
-                boost_term_s1 += get_boost_multiplier(state.side_one.attack_boost) * POKEMON_ATTACK_BOOST * s1_hp_ratio;
-                boost_term_s1 += get_boost_multiplier(state.side_one.defense_boost) * POKEMON_DEFENSE_BOOST * s1_hp_ratio;
+                boost_term_s1 += get_boost_multiplier(state.side_one.attack_boost) * POKEMON_ATTACK_BOOST;
+                boost_term_s1 += get_boost_multiplier(state.side_one.defense_boost) * POKEMON_DEFENSE_BOOST;
                 boost_term_s1 += get_boost_multiplier(state.side_one.special_attack_boost)
-                    * POKEMON_SPECIAL_ATTACK_BOOST * s1_hp_ratio;
+                    * POKEMON_SPECIAL_ATTACK_BOOST;
                 boost_term_s1 += get_boost_multiplier(state.side_one.special_defense_boost)
-                    * POKEMON_SPECIAL_DEFENSE_BOOST * s1_hp_ratio;
-                boost_term_s1 += get_boost_multiplier(state.side_one.speed_boost) * POKEMON_SPEED_BOOST * s1_hp_ratio;
+                    * POKEMON_SPECIAL_DEFENSE_BOOST;
+                boost_term_s1 += get_boost_multiplier(state.side_one.speed_boost) * POKEMON_SPEED_BOOST;
             }
         }
         if pkmn.terastallized {
@@ -611,14 +607,13 @@ pub fn evaluate_breakdown(state: &State) -> EvalBreakdown {
                         _ => {}
                     }
                 }
-                let s2_hp_ratio = boost_hp_multiplier(pkmn.hp, pkmn.maxhp);
-                boost_term_s2 -= get_boost_multiplier(state.side_two.attack_boost) * POKEMON_ATTACK_BOOST * s2_hp_ratio;
-                boost_term_s2 -= get_boost_multiplier(state.side_two.defense_boost) * POKEMON_DEFENSE_BOOST * s2_hp_ratio;
+                boost_term_s2 -= get_boost_multiplier(state.side_two.attack_boost) * POKEMON_ATTACK_BOOST;
+                boost_term_s2 -= get_boost_multiplier(state.side_two.defense_boost) * POKEMON_DEFENSE_BOOST;
                 boost_term_s2 -= get_boost_multiplier(state.side_two.special_attack_boost)
-                    * POKEMON_SPECIAL_ATTACK_BOOST * s2_hp_ratio;
+                    * POKEMON_SPECIAL_ATTACK_BOOST;
                 boost_term_s2 -= get_boost_multiplier(state.side_two.special_defense_boost)
-                    * POKEMON_SPECIAL_DEFENSE_BOOST * s2_hp_ratio;
-                boost_term_s2 -= get_boost_multiplier(state.side_two.speed_boost) * POKEMON_SPEED_BOOST * s2_hp_ratio;
+                    * POKEMON_SPECIAL_DEFENSE_BOOST;
+                boost_term_s2 -= get_boost_multiplier(state.side_two.speed_boost) * POKEMON_SPEED_BOOST;
             }
         }
         if pkmn.terastallized {
