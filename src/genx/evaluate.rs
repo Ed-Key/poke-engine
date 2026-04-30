@@ -10,11 +10,15 @@ const POKEMON_ALIVE: f32 = 30.0;
 const POKEMON_HP: f32 = 100.0;
 const USED_TERA: f32 = -75.0;
 
-const POKEMON_ATTACK_BOOST: f32 = 30.0;
+// Fix #2.5: reduced 30.0 → 25.0 for atk/spa/spe to compensate for
+// double-counting with threat_score × THREAT_SCORE_WEIGHT (40), which
+// already credits +2 offense at roughly +24 per side. Defensive boosts
+// unchanged (foul-play parity, no offense double-count).
+const POKEMON_ATTACK_BOOST: f32 = 25.0;
 const POKEMON_DEFENSE_BOOST: f32 = 15.0;
-const POKEMON_SPECIAL_ATTACK_BOOST: f32 = 30.0;
+const POKEMON_SPECIAL_ATTACK_BOOST: f32 = 25.0;
 const POKEMON_SPECIAL_DEFENSE_BOOST: f32 = 15.0;
-const POKEMON_SPEED_BOOST: f32 = 30.0;
+const POKEMON_SPEED_BOOST: f32 = 25.0;
 
 pub const THREAT_SCORE_WEIGHT: f32 = 40.0;
 pub const MORTALITY_SCORE_WEIGHT: f32 = 20.0;
@@ -1191,8 +1195,8 @@ mod tests {
         // boost_term scales linearly with the *active*'s side-level boost,
         // not with the count of bench mons.
         assert!(
-            (bd_bench.boost_term_s1 - 60.0).abs() < 0.001,
-            "active mon at +2 SpA should give +60 boost (regardless of bench), got {}",
+            (bd_bench.boost_term_s1 - 50.0).abs() < 0.001,
+            "active mon at +2 SpA should give +50 boost (regardless of bench), got {}",
             bd_bench.boost_term_s1
         );
     }
@@ -1212,5 +1216,22 @@ mod tests {
             "fainted active must zero out boost_term_s1, got {}",
             bd.boost_term_s1
         );
+    }
+
+    #[test]
+    fn test_constants_match_design() {
+        // Fix #2.5: offensive boost constants reduced 30.0 → 25.0 to
+        // compensate for double-counting with threat_score × 40
+        // (threat_score already reads +2 Atk as roughly +24 per side).
+        // Defensive boosts unchanged (foul-play parity, no double-count
+        // with threat_score which only reads offense).
+        //
+        // These assertions are static enough that a constant change without
+        // an intentional design decision will fail this test.
+        assert_eq!(super::POKEMON_ATTACK_BOOST, 25.0);
+        assert_eq!(super::POKEMON_DEFENSE_BOOST, 15.0);
+        assert_eq!(super::POKEMON_SPECIAL_ATTACK_BOOST, 25.0);
+        assert_eq!(super::POKEMON_SPECIAL_DEFENSE_BOOST, 15.0);
+        assert_eq!(super::POKEMON_SPEED_BOOST, 25.0);
     }
 }
