@@ -192,3 +192,108 @@ fn matchup_switch_returns_none_when_last_alive() {
     let pick = matchup_switch_pick(&state, SidePerspective::Side1);
     assert_eq!(pick, None);
 }
+
+use poke_engine::heuristic_prior::compute;
+
+/// Standard case: damage-calc picks EQ (slot 1 alphabetically among
+/// dragonclaw/earthquake/stoneedge/swordsdance), switch picks Heatran
+/// (the only bench Pokemon with hp>0 here, so slot 4 in switch range).
+/// Mass should be: 0.6 on EQ slot, 0.3 on Heatran slot, remaining 0.1
+/// shared among other LEGAL slots.
+#[test]
+fn compute_returns_correct_mass_distribution() {
+    let mut state = State::default();
+    state.side_one.get_active().id = PokemonName::GARCHOMP;
+    state.side_one.get_active().attack = 359;
+    state.side_one.get_active().types = (
+        poke_engine::state::PokemonType::DRAGON,
+        poke_engine::state::PokemonType::GROUND,
+    );
+    state
+        .side_one
+        .get_active()
+        .replace_move(PokemonMoveIndex::M0, Choices::DRAGONCLAW);
+    state
+        .side_one
+        .get_active()
+        .replace_move(PokemonMoveIndex::M1, Choices::EARTHQUAKE);
+    state
+        .side_one
+        .get_active()
+        .replace_move(PokemonMoveIndex::M2, Choices::STONEEDGE);
+    state
+        .side_one
+        .get_active()
+        .replace_move(PokemonMoveIndex::M3, Choices::SWORDSDANCE);
+
+    // Bench[1] = Heatran (only live bench Pokemon).
+    state.side_one.pokemon[PokemonIndex::P1].id = PokemonName::HEATRAN;
+    state.side_one.pokemon[PokemonIndex::P1].hp = 385;
+    state.side_one.pokemon[PokemonIndex::P1].maxhp = 385;
+    state.side_one.pokemon[PokemonIndex::P1].types = (
+        poke_engine::state::PokemonType::FIRE,
+        poke_engine::state::PokemonType::STEEL,
+    );
+    state.side_one.pokemon[PokemonIndex::P1]
+        .replace_move(PokemonMoveIndex::M0, Choices::EARTHPOWER);
+    // Faint P2-P5 to leave only Heatran on the bench.
+    for idx in [PokemonIndex::P2, PokemonIndex::P3, PokemonIndex::P4, PokemonIndex::P5] {
+        state.side_one.pokemon[idx].hp = 0;
+    }
+
+    state.side_two.get_active().id = PokemonName::HEATRAN;
+    state.side_two.get_active().types = (
+        poke_engine::state::PokemonType::FIRE,
+        poke_engine::state::PokemonType::STEEL,
+    );
+    state.side_two.get_active().hp = 385;
+    state.side_two.get_active().maxhp = 385;
+    state.side_two.get_active().defense = 248;
+    state.side_two.get_active().special_defense = 384;
+    state
+        .side_two
+        .get_active()
+        .replace_move(PokemonMoveIndex::M0, Choices::MAGMASTORM);
+
+    let (s1_options, _) = state.root_get_all_options();
+    let result = compute(&state, SidePerspective::Side1, &s1_options, 0.6, 0.3)
+        .expect("heuristic should succeed");
+
+    assert_eq!(result.damage_calc_pick, Some(Choices::EARTHQUAKE));
+    assert_eq!(result.matchup_switch_pick, Some(PokemonName::HEATRAN));
+
+    let total: f32 = result.probs.iter().sum();
+    assert!((total - 1.0).abs() < 1e-4, "mass must sum to 1.0; got {}", total);
+
+    // EQ is alphabetical slot 1 among the four moves
+    // (dragonclaw=0, earthquake=1, stoneedge=2, swordsdance=3).
+    assert!(
+        (result.probs[1] - 0.6).abs() < 1e-4,
+        "slot 1 (EQ) must have 0.6 mass; got {}",
+        result.probs[1]
+    );
+}
+
+/// All bench fainted + locked into status moves: both picks skip,
+/// compute returns None.
+#[test]
+fn compute_returns_none_when_both_picks_skip() {
+    let mut state = State::default();
+    // Faint all bench so matchup_switch_pick returns None.
+    for idx in [PokemonIndex::P1, PokemonIndex::P2, PokemonIndex::P3, PokemonIndex::P4, PokemonIndex::P5] {
+        state.side_one.pokemon[idx].hp = 0;
+    }
+    // Active has only status moves so damage_calc_top_move returns None.
+    state
+        .side_one
+        .get_active()
+        .replace_move(PokemonMoveIndex::M0, Choices::SWORDSDANCE);
+    state
+        .side_one
+        .get_active()
+        .replace_move(PokemonMoveIndex::M1, Choices::RECOVER);
+
+    let (s1_options, _) = state.root_get_all_options();
+    let result = compute(&state, SidePerspective::Side1, &s1_options, 0.6, 0.3);
+    assert!(result.is_none(), "expected None when both heuristics skip; got {:?}", result);
+}

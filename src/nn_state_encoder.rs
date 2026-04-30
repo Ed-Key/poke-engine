@@ -374,7 +374,7 @@ pub fn map_policy_to_options(
 
 /// Return the 4 move IDs (raw `Choices` debug strings, lowercase) for the
 /// active Pokemon — including blank slots so the indexing matches `M0..M3`.
-fn active_move_ids(p: &Pokemon) -> Vec<String> {
+pub(crate) fn active_move_ids(p: &Pokemon) -> Vec<String> {
     vec![
         format!("{:?}", p.moves.m0.id).to_lowercase(),
         format!("{:?}", p.moves.m1.id).to_lowercase(),
@@ -385,7 +385,7 @@ fn active_move_ids(p: &Pokemon) -> Vec<String> {
 
 /// Return reserve species names in `PokemonIndex` order, EXCLUDING the active
 /// slot. Length is 5 (six total minus active).
-fn reserve_species(side: &Side) -> Vec<String> {
+pub(crate) fn reserve_species(side: &Side) -> Vec<String> {
     let mut out = Vec::with_capacity(5);
     for idx in 0..6 {
         let pidx = match idx {
@@ -407,7 +407,7 @@ fn reserve_species(side: &Side) -> Vec<String> {
 /// Reverse of `reserve_species`: given a `PokemonIndex` for a (non-active)
 /// reserve slot, find its 0..4 position in the reserves list. Returns
 /// `None` if `pidx` is the active slot.
-fn reserve_slot_for(side: &Side, pidx: PokemonIndex) -> Option<usize> {
+pub(crate) fn reserve_slot_for(side: &Side, pidx: PokemonIndex) -> Option<usize> {
     if pidx == side.active_index {
         return None;
     }
@@ -432,7 +432,7 @@ fn reserve_slot_for(side: &Side, pidx: PokemonIndex) -> Option<usize> {
     None
 }
 
-fn move_index_to_slot(idx: PokemonMoveIndex) -> usize {
+pub(crate) fn move_index_to_slot(idx: PokemonMoveIndex) -> usize {
     match idx {
         PokemonMoveIndex::M0 => 0,
         PokemonMoveIndex::M1 => 1,
@@ -465,7 +465,7 @@ fn pokemon_index_to_usize(idx: PokemonIndex) -> usize {
 ///   ⇒ ranks for input order [earthquake, scaleshot, stealthrock, spikes]:
 ///     earthquake → 0 (smallest), scaleshot → 1 (next), stealthrock → 3,
 ///     spikes → 2.
-fn alpha_perm_with_norm<F>(items: &[String], norm: F) -> Vec<usize>
+pub(crate) fn alpha_perm_with_norm<F>(items: &[String], norm: F) -> Vec<usize>
 where
     F: Fn(&str) -> String,
 {
