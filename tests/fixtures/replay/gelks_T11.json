@@ -1,0 +1,49 @@
+{
+    "timeLimit": 5000,
+    "sideOne": {
+        "pokemon": [{
+            "species": "Dragonite",
+            "level": 100,
+            "types": ["Dragon", "Flying"],
+            "hp": 386, "maxhp": 386,
+            "ability": "Multiscale", "item": "Heavy-Duty Boots", "nature": "Adamant",
+            "evs": {"hp": 0, "atk": 252, "def": 0, "spa": 0, "spd": 4, "spe": 252},
+            "attack": 403, "defense": 226, "specialAttack": 200, "specialDefense": 226, "speed": 236,
+            "boosts": {"attack": 1},
+            "status": "None", "weightKg": 210.0,
+            "moves": [
+                {"id": "Earthquake", "pp": 16},
+                {"id": "Ice Spinner", "pp": 24},
+                {"id": "Extreme Speed", "pp": 8},
+                {"id": "Dragon Dance", "pp": 32}
+            ],
+            "teraType": "Normal"
+        }],
+        "activeIndex": 0,
+        "sideConditions": {"stealthRock": 0, "spikes": 0, "toxicSpikes": 0, "stickyWeb": 0}
+    },
+    "sideTwo": {
+        "pokemon": [{
+            "species": "Greninja",
+            "level": 100,
+            "types": ["Water", "Dark"],
+            "hp": 285, "maxhp": 285,
+            "ability": "Protean", "item": "Choice Specs", "nature": "Timid",
+            "evs": {"hp": 0, "atk": 0, "def": 0, "spa": 252, "spd": 4, "spe": 252},
+            "attack": 200, "defense": 178, "specialAttack": 350, "specialDefense": 192, "speed": 377,
+            "status": "None", "weightKg": 40.0,
+            "moves": [
+                {"id": "Hydro Pump", "pp": 8},
+                {"id": "Dark Pulse", "pp": 24},
+                {"id": "Ice Beam", "pp": 16},
+                {"id": "U-turn", "pp": 32}
+            ],
+            "teraType": "Water"
+        }],
+        "activeIndex": 0,
+        "sideConditions": {"stealthRock": 0, "spikes": 0, "toxicSpikes": 0, "stickyWeb": 0}
+    },
+    "weather": {"weatherType": "none", "turnsRemaining": -1},
+    "terrain": {"terrainType": "none", "turnsRemaining": -1},
+    "trickRoom": false
+}

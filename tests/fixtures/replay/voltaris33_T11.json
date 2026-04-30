@@ -1,0 +1,48 @@
+{
+    "timeLimit": 5000,
+    "sideOne": {
+        "pokemon": [{
+            "species": "Tyranitar",
+            "level": 100,
+            "types": ["Rock", "Dark"],
+            "hp": 341, "maxhp": 341,
+            "ability": "Sand Stream", "item": "Smooth Rock", "nature": "Adamant",
+            "evs": {"hp": 0, "atk": 252, "def": 4, "spa": 0, "spd": 0, "spe": 252},
+            "attack": 403, "defense": 256, "specialAttack": 200, "specialDefense": 286, "speed": 243,
+            "status": "None", "weightKg": 202.0,
+            "moves": [
+                {"id": "Stealth Rock", "pp": 32},
+                {"id": "Stone Edge", "pp": 8},
+                {"id": "Earthquake", "pp": 16},
+                {"id": "Crunch", "pp": 24}
+            ],
+            "teraType": "Dark"
+        }],
+        "activeIndex": 0,
+        "sideConditions": {"stealthRock": 0, "spikes": 0, "toxicSpikes": 0, "stickyWeb": 0}
+    },
+    "sideTwo": {
+        "pokemon": [{
+            "species": "Dragapult",
+            "level": 100,
+            "types": ["Dragon", "Ghost"],
+            "hp": 297, "maxhp": 297,
+            "ability": "Clear Body", "item": "Choice Specs", "nature": "Timid",
+            "evs": {"hp": 0, "atk": 0, "def": 0, "spa": 252, "spd": 4, "spe": 252},
+            "attack": 200, "defense": 200, "specialAttack": 350, "specialDefense": 200, "speed": 421,
+            "status": "None", "weightKg": 50.0,
+            "moves": [
+                {"id": "Draco Meteor", "pp": 8},
+                {"id": "Shadow Ball", "pp": 24},
+                {"id": "Flamethrower", "pp": 24},
+                {"id": "U-turn", "pp": 32}
+            ],
+            "teraType": "Fairy"
+        }],
+        "activeIndex": 0,
+        "sideConditions": {"stealthRock": 1, "spikes": 0, "toxicSpikes": 0, "stickyWeb": 0}
+    },
+    "weather": {"weatherType": "none", "turnsRemaining": -1},
+    "terrain": {"terrainType": "none", "turnsRemaining": -1},
+    "trickRoom": false
+}

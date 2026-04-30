@@ -1,0 +1,48 @@
+{
+    "timeLimit": 5000,
+    "sideOne": {
+        "pokemon": [{
+            "species": "Gholdengo",
+            "level": 100,
+            "types": ["Steel", "Ghost"],
+            "hp": 322, "maxhp": 322,
+            "ability": "Good as Gold", "item": "Air Balloon", "nature": "Modest",
+            "evs": {"hp": 0, "atk": 0, "def": 0, "spa": 252, "spd": 4, "spe": 252},
+            "attack": 158, "defense": 246, "specialAttack": 359, "specialDefense": 226, "speed": 282,
+            "status": "None", "weightKg": 30.0,
+            "moves": [
+                {"id": "Make It Rain", "pp": 8},
+                {"id": "Shadow Ball", "pp": 24},
+                {"id": "Nasty Plot", "pp": 32},
+                {"id": "Recover", "pp": 16}
+            ],
+            "teraType": "Steel"
+        }],
+        "activeIndex": 0,
+        "sideConditions": {"stealthRock": 0, "spikes": 0, "toxicSpikes": 0, "stickyWeb": 0}
+    },
+    "sideTwo": {
+        "pokemon": [{
+            "species": "Gallade-Mega",
+            "level": 100,
+            "types": ["Psychic", "Fighting"],
+            "hp": 311, "maxhp": 311,
+            "ability": "Inner Focus", "item": "Galladite", "nature": "Jolly",
+            "evs": {"hp": 0, "atk": 252, "def": 0, "spa": 0, "spd": 4, "spe": 252},
+            "attack": 405, "defense": 246, "specialAttack": 200, "specialDefense": 296, "speed": 339,
+            "status": "None", "weightKg": 56.4,
+            "moves": [
+                {"id": "Close Combat", "pp": 8},
+                {"id": "Psycho Cut", "pp": 32},
+                {"id": "Bulk Up", "pp": 32},
+                {"id": "Drain Punch", "pp": 16}
+            ],
+            "teraType": "Fighting"
+        }],
+        "activeIndex": 0,
+        "sideConditions": {"stealthRock": 0, "spikes": 0, "toxicSpikes": 0, "stickyWeb": 0}
+    },
+    "weather": {"weatherType": "none", "turnsRemaining": -1},
+    "terrain": {"terrainType": "none", "turnsRemaining": -1},
+    "trickRoom": false
+}
