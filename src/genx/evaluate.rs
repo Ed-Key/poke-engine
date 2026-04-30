@@ -509,6 +509,184 @@ pub fn evaluate(state: &State) -> f32 {
     score
 }
 
+/// Per-term breakdown of the heuristic eval. `total` is constructed to equal
+/// `evaluate(state)` by construction (asserted by `test_breakdown_matches_evaluate`).
+///
+/// Used only for instrumentation/logging — the production hot path goes through
+/// `evaluate(state) -> f32` which is unchanged. `evaluate_breakdown` is fine for
+/// per-request structured logging but is NOT optimized for the rollout loop.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EvalBreakdown {
+    /// Sum of all terms below; equals `evaluate(state)`.
+    pub total: f32,
+    /// Sum over both sides of `evaluate_pokemon` (HP, status, item, alive bonus).
+    /// Side 1 contributes positive, side 2 negative — same signing convention
+    /// as `evaluate`.
+    pub hp_term: f32,
+    /// Hazard contribution (Stealth Rock, Spikes, Toxic Spikes, Sticky Web)
+    /// for both sides, scaled by hazard_value_factor.
+    pub hazards_term: f32,
+    /// Side-1 active stat-boost contribution (atk/def/spA/spD/spe), HP-scaled.
+    pub boost_term_s1: f32,
+    /// Side-2 active stat-boost contribution.
+    pub boost_term_s2: f32,
+    /// `threat_score(SideOne) * THREAT_SCORE_WEIGHT` minus
+    /// `mortality_score(SideOne) * MORTALITY_SCORE_WEIGHT` -- all the s1
+    /// damage-output / damage-taken offense terms.
+    pub threat_score_s1: f32,
+    /// Mirror for s2.
+    pub threat_score_s2: f32,
+    /// Active Pokémon volatile statuses (Leech Seed, Substitute, Confusion)
+    /// summed across both sides.
+    pub volatile_status_term: f32,
+    /// Side conditions (Reflect, Light Screen, Aurora Veil, Safeguard,
+    /// Tailwind, Healing Wish) summed across both sides.
+    pub side_conditions_term: f32,
+    /// Tera-used penalty (USED_TERA flag) summed across both sides.
+    pub tera_term: f32,
+    /// `status_threat_score(...) * STATUS_THREAT_WEIGHT` for both sides
+    /// (signed). Captures Sleep Powder / Will-O-Wisp / Leech Seed value.
+    pub status_threat_term: f32,
+}
+
+/// Mirror of `evaluate` that returns a per-term breakdown. The summed `total`
+/// equals `evaluate(state)` exactly (verified by unit test). Used for the
+/// `[ENGINE-INSTRUMENT]` JSON log line; do NOT call from the rollout loop.
+pub fn evaluate_breakdown(state: &State) -> EvalBreakdown {
+    let mut hp_term: f32 = 0.0;
+    let mut hazards_term: f32 = 0.0;
+    let mut boost_term_s1: f32 = 0.0;
+    let mut boost_term_s2: f32 = 0.0;
+    let mut volatile_status_term: f32 = 0.0;
+    let mut tera_term: f32 = 0.0;
+
+    let s1_hazard_factor = hazard_value_factor(state.side_one.get_active_immutable());
+    let s2_hazard_factor = hazard_value_factor(state.side_two.get_active_immutable());
+
+    let mut iter = state.side_one.pokemon.into_iter();
+    let mut s1_used_tera = false;
+    while let Some(pkmn) = iter.next() {
+        if pkmn.hp > 0 {
+            hp_term += evaluate_pokemon(pkmn);
+            hazards_term += evaluate_hazards(pkmn, &state.side_one) * s1_hazard_factor;
+            if iter.pokemon_index == state.side_one.active_index {
+                for vs in state.side_one.volatile_statuses.iter() {
+                    match vs {
+                        PokemonVolatileStatus::LEECHSEED => volatile_status_term += LEECH_SEED,
+                        PokemonVolatileStatus::SUBSTITUTE => volatile_status_term += SUBSTITUTE,
+                        PokemonVolatileStatus::CONFUSION => volatile_status_term += CONFUSION,
+                        _ => {}
+                    }
+                }
+                let s1_hp_ratio = boost_hp_multiplier(pkmn.hp, pkmn.maxhp);
+                boost_term_s1 += get_boost_multiplier(state.side_one.attack_boost) * POKEMON_ATTACK_BOOST * s1_hp_ratio;
+                boost_term_s1 += get_boost_multiplier(state.side_one.defense_boost) * POKEMON_DEFENSE_BOOST * s1_hp_ratio;
+                boost_term_s1 += get_boost_multiplier(state.side_one.special_attack_boost)
+                    * POKEMON_SPECIAL_ATTACK_BOOST * s1_hp_ratio;
+                boost_term_s1 += get_boost_multiplier(state.side_one.special_defense_boost)
+                    * POKEMON_SPECIAL_DEFENSE_BOOST * s1_hp_ratio;
+                boost_term_s1 += get_boost_multiplier(state.side_one.speed_boost) * POKEMON_SPEED_BOOST * s1_hp_ratio;
+            }
+        }
+        if pkmn.terastallized {
+            s1_used_tera = true;
+        }
+    }
+    if s1_used_tera {
+        tera_term += USED_TERA;
+    }
+
+    let mut iter = state.side_two.pokemon.into_iter();
+    let mut s2_used_tera = false;
+    while let Some(pkmn) = iter.next() {
+        if pkmn.hp > 0 {
+            hp_term -= evaluate_pokemon(pkmn);
+            hazards_term -= evaluate_hazards(pkmn, &state.side_two) * s2_hazard_factor;
+            if iter.pokemon_index == state.side_two.active_index {
+                for vs in state.side_two.volatile_statuses.iter() {
+                    match vs {
+                        PokemonVolatileStatus::LEECHSEED => volatile_status_term -= LEECH_SEED,
+                        PokemonVolatileStatus::SUBSTITUTE => volatile_status_term -= SUBSTITUTE,
+                        PokemonVolatileStatus::CONFUSION => volatile_status_term -= CONFUSION,
+                        _ => {}
+                    }
+                }
+                let s2_hp_ratio = boost_hp_multiplier(pkmn.hp, pkmn.maxhp);
+                boost_term_s2 -= get_boost_multiplier(state.side_two.attack_boost) * POKEMON_ATTACK_BOOST * s2_hp_ratio;
+                boost_term_s2 -= get_boost_multiplier(state.side_two.defense_boost) * POKEMON_DEFENSE_BOOST * s2_hp_ratio;
+                boost_term_s2 -= get_boost_multiplier(state.side_two.special_attack_boost)
+                    * POKEMON_SPECIAL_ATTACK_BOOST * s2_hp_ratio;
+                boost_term_s2 -= get_boost_multiplier(state.side_two.special_defense_boost)
+                    * POKEMON_SPECIAL_DEFENSE_BOOST * s2_hp_ratio;
+                boost_term_s2 -= get_boost_multiplier(state.side_two.speed_boost) * POKEMON_SPEED_BOOST * s2_hp_ratio;
+            }
+        }
+        if pkmn.terastallized {
+            s2_used_tera = true;
+        }
+    }
+    if s2_used_tera {
+        tera_term -= USED_TERA;
+    }
+
+    // Threat / mortality / status_threat: only the active mons matter; matching
+    // the gating in `evaluate` (only added when the active is alive).
+    let s1_active_alive = state.side_one.get_active_immutable().hp > 0;
+    let s2_active_alive = state.side_two.get_active_immutable().hp > 0;
+    let mut threat_score_s1 = 0.0_f32;
+    let mut threat_score_s2 = 0.0_f32;
+    let mut status_threat_term = 0.0_f32;
+    if s1_active_alive {
+        threat_score_s1 += threat_score(state, &SideReference::SideOne) * THREAT_SCORE_WEIGHT;
+        threat_score_s1 -= mortality_score(state, &SideReference::SideOne) * MORTALITY_SCORE_WEIGHT;
+        status_threat_term += status_threat_score(state, &SideReference::SideOne) * STATUS_THREAT_WEIGHT;
+    }
+    if s2_active_alive {
+        threat_score_s2 -= threat_score(state, &SideReference::SideTwo) * THREAT_SCORE_WEIGHT;
+        threat_score_s2 += mortality_score(state, &SideReference::SideTwo) * MORTALITY_SCORE_WEIGHT;
+        status_threat_term -= status_threat_score(state, &SideReference::SideTwo) * STATUS_THREAT_WEIGHT;
+    }
+
+    let mut side_conditions_term: f32 = 0.0;
+    side_conditions_term += state.side_one.side_conditions.reflect as f32 * REFLECT;
+    side_conditions_term += state.side_one.side_conditions.light_screen as f32 * LIGHT_SCREEN;
+    side_conditions_term += state.side_one.side_conditions.aurora_veil as f32 * AURORA_VEIL;
+    side_conditions_term += state.side_one.side_conditions.safeguard as f32 * SAFE_GUARD;
+    side_conditions_term += state.side_one.side_conditions.tailwind as f32 * TAILWIND;
+    side_conditions_term += state.side_one.side_conditions.healing_wish as f32 * HEALING_WISH;
+    side_conditions_term -= state.side_two.side_conditions.reflect as f32 * REFLECT;
+    side_conditions_term -= state.side_two.side_conditions.light_screen as f32 * LIGHT_SCREEN;
+    side_conditions_term -= state.side_two.side_conditions.aurora_veil as f32 * AURORA_VEIL;
+    side_conditions_term -= state.side_two.side_conditions.safeguard as f32 * SAFE_GUARD;
+    side_conditions_term -= state.side_two.side_conditions.tailwind as f32 * TAILWIND;
+    side_conditions_term -= state.side_two.side_conditions.healing_wish as f32 * HEALING_WISH;
+
+    let total = hp_term
+        + hazards_term
+        + boost_term_s1
+        + boost_term_s2
+        + threat_score_s1
+        + threat_score_s2
+        + volatile_status_term
+        + side_conditions_term
+        + tera_term
+        + status_threat_term;
+
+    EvalBreakdown {
+        total,
+        hp_term,
+        hazards_term,
+        boost_term_s1,
+        boost_term_s2,
+        threat_score_s1,
+        threat_score_s2,
+        volatile_status_term,
+        side_conditions_term,
+        tera_term,
+        status_threat_term,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::choices::{Choice, Choices, MoveCategory};
@@ -617,6 +795,45 @@ mod tests {
             "evaluate must favor boosted side_one (base={}, boosted={})",
             base_eval, boosted_eval
         );
+    }
+
+    #[test]
+    fn test_breakdown_matches_evaluate() {
+        // For a handful of representative states, evaluate_breakdown(state).total
+        // must equal evaluate(state) within float epsilon. Anything wider would
+        // indicate a missing term in the breakdown.
+        let mut states = Vec::new();
+        states.push(State::default());
+
+        let mut s_boosted = State::default();
+        s_boosted.side_one.attack_boost = 2;
+        s_boosted.side_one.speed_boost = 1;
+        s_boosted.side_two.special_attack_boost = -1;
+        states.push(s_boosted);
+
+        let mut s_hazards = State::default();
+        s_hazards.side_one.side_conditions.stealth_rock = 1;
+        s_hazards.side_one.side_conditions.spikes = 2;
+        s_hazards.side_two.side_conditions.sticky_web = 1;
+        s_hazards.side_two.side_conditions.tailwind = 3;
+        s_hazards.side_one.side_conditions.reflect = 1;
+        states.push(s_hazards);
+
+        let mut s_chipped = State::default();
+        s_chipped.side_one.get_active().hp = 50;
+        s_chipped.side_two.get_active().hp = 1;
+        states.push(s_chipped);
+
+        for (i, state) in states.iter().enumerate() {
+            let eval_total = super::evaluate(state);
+            let breakdown = super::evaluate_breakdown(state);
+            let diff = (eval_total - breakdown.total).abs();
+            assert!(
+                diff < 0.001,
+                "case {}: breakdown.total ({}) must equal evaluate ({}); diff={} breakdown={:?}",
+                i, breakdown.total, eval_total, diff, breakdown
+            );
+        }
     }
 
     #[test]
@@ -855,5 +1072,59 @@ mod tests {
         // < 40% HP → negative reward (penalize setup)
         assert_eq!(super::boost_hp_multiplier(39, 100), -0.5);
         assert_eq!(super::boost_hp_multiplier(1, 100), -0.5);
+    }
+
+    #[test]
+    fn test_boost_term_kaizo_schedule_in_breakdown() {
+        // Build a state with side_one's active at +2 SpA, vary HP across the
+        // three Kaizo brackets, and confirm the boost_term_s1 magnitude flips
+        // as expected. Also verify the evaluate <=> evaluate_breakdown
+        // invariant still holds at each HP point.
+
+        // At +2 stage, get_boost_multiplier returns POKEMON_BOOST_MULTIPLIER_2 = 2.0,
+        // so the SpA contribution is 2.0 * 30.0 * multiplier = 60 * multiplier.
+
+        // Case 1: 100% HP (full credit) → boost_term_s1 ~= +60
+        let mut state_full = State::default();
+        state_full.side_one.special_attack_boost = 2;
+        let bd_full = super::evaluate_breakdown(&state_full);
+        assert!(
+            (bd_full.boost_term_s1 - 60.0).abs() < 0.001,
+            "100% HP: boost_term_s1 should be ~+60, got {}",
+            bd_full.boost_term_s1
+        );
+        let diff_full = (super::evaluate(&state_full) - bd_full.total).abs();
+        assert!(diff_full < 0.001, "invariant broken at 100% HP: diff={}", diff_full);
+
+        // Case 2: 50% HP (Kaizo marginal band) → boost_term_s1 == 0
+        let mut state_mid = State::default();
+        state_mid.side_one.special_attack_boost = 2;
+        state_mid.side_one.get_active().hp = 50;
+        let bd_mid = super::evaluate_breakdown(&state_mid);
+        assert!(
+            bd_mid.boost_term_s1.abs() < 0.001,
+            "50% HP: boost_term_s1 should be ~0 (Kaizo zero-out), got {}",
+            bd_mid.boost_term_s1
+        );
+        let diff_mid = (super::evaluate(&state_mid) - bd_mid.total).abs();
+        assert!(diff_mid < 0.001, "invariant broken at 50% HP: diff={}", diff_mid);
+
+        // Case 3: 30% HP (dangerous) → boost_term_s1 < 0 (~-30 from -0.5 × 60)
+        let mut state_low = State::default();
+        state_low.side_one.special_attack_boost = 2;
+        state_low.side_one.get_active().hp = 30;
+        let bd_low = super::evaluate_breakdown(&state_low);
+        assert!(
+            bd_low.boost_term_s1 < 0.0,
+            "30% HP: boost_term_s1 should be negative, got {}",
+            bd_low.boost_term_s1
+        );
+        assert!(
+            (bd_low.boost_term_s1 - (-30.0)).abs() < 0.001,
+            "30% HP: boost_term_s1 should be ~-30 (-0.5 × 60), got {}",
+            bd_low.boost_term_s1
+        );
+        let diff_low = (super::evaluate(&state_low) - bd_low.total).abs();
+        assert!(diff_low < 0.001, "invariant broken at 30% HP: diff={}", diff_low);
     }
 }

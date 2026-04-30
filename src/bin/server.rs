@@ -7,6 +7,7 @@ use axum::{
     Router,
 };
 use clap::Parser;
+use poke_engine::engine::evaluate::{evaluate_breakdown, EvalBreakdown};
 use poke_engine::eval_kind::EvalKind;
 use poke_engine::mcts::{MctsResult, MctsSearch};
 use poke_engine::nn_client::NnClient;
@@ -385,6 +386,103 @@ fn build_stream_update(
     }
 }
 
+/// Emit a single-line `[ENGINE-INSTRUMENT]` JSON log with the eval breakdown
+/// + top-5 s1 / top-3 s2 MCTS branches (visits, avg value, prior). Designed
+/// to be greppable from `~/plan-e-engine-*.log` for post-hoc diagnostics of
+/// "why did the engine pick X?" — never used for control flow, observation
+/// only.
+///
+/// Call once per `/analyze/stream` request, AFTER the final MCTS snapshot,
+/// so visit counts are populated. JSON is kept under ~1KB by truncating to
+/// top-5/top-3 with rounded floats. If the result has 0 sims, we still emit
+/// (with an empty branches array) — silence is worse than empty.
+fn emit_engine_instrument(
+    breakdown: &EvalBreakdown,
+    mcts_result: &MctsResult,
+    s1_move_names: &[String],
+    s2_move_names: &[String],
+    label: &str,
+) {
+    fn round2(x: f32) -> f32 {
+        // Round to 2 decimals to keep log lines compact and stable.
+        (x * 100.0).round() / 100.0
+    }
+    fn round4(x: f32) -> f32 {
+        (x * 10000.0).round() / 10000.0
+    }
+
+    // Sort s1 by visits desc, take top 5.
+    let mut s1_idx: Vec<usize> = (0..mcts_result.s1.len()).collect();
+    s1_idx.sort_by(|a, b| mcts_result.s1[*b].visits.cmp(&mcts_result.s1[*a].visits));
+    let my_top5: Vec<serde_json::Value> = s1_idx
+        .iter()
+        .take(5)
+        .map(|&i| {
+            let r = &mcts_result.s1[i];
+            let name = s1_move_names
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| format!("{:?}", r.move_choice))
+                .to_uppercase();
+            let avg = if r.visits > 0 { r.total_score / r.visits as f32 } else { 0.0 };
+            // Prior is not stored on MctsSideResult — we don't expose root
+            // priors through snapshot(). Caller-visible workaround: prior
+            // is implicit via visit share. Emit null and let the analyst
+            // compute share from total iterations if needed.
+            serde_json::json!({
+                "move": name,
+                "visits": r.visits,
+                "value": round4(avg),
+            })
+        })
+        .collect();
+
+    let mut s2_idx: Vec<usize> = (0..mcts_result.s2.len()).collect();
+    s2_idx.sort_by(|a, b| mcts_result.s2[*b].visits.cmp(&mcts_result.s2[*a].visits));
+    let opp_top3: Vec<serde_json::Value> = s2_idx
+        .iter()
+        .take(3)
+        .map(|&i| {
+            let r = &mcts_result.s2[i];
+            let name = s2_move_names
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| format!("{:?}", r.move_choice))
+                .to_uppercase();
+            let avg = if r.visits > 0 { r.total_score / r.visits as f32 } else { 0.0 };
+            serde_json::json!({
+                "move": name,
+                "visits": r.visits,
+                "value": round4(avg),
+            })
+        })
+        .collect();
+
+    let payload = serde_json::json!({
+        "label": label,
+        "sims": mcts_result.iteration_count,
+        "my_top5": my_top5,
+        "opp_top3": opp_top3,
+        "eval_breakdown": {
+            "total": round2(breakdown.total),
+            "hp_term": round2(breakdown.hp_term),
+            "hazards_term": round2(breakdown.hazards_term),
+            "boost_term_s1": round2(breakdown.boost_term_s1),
+            "boost_term_s2": round2(breakdown.boost_term_s2),
+            "threat_score_s1": round2(breakdown.threat_score_s1),
+            "threat_score_s2": round2(breakdown.threat_score_s2),
+            "volatile_status_term": round2(breakdown.volatile_status_term),
+            "side_conditions_term": round2(breakdown.side_conditions_term),
+            "tera_term": round2(breakdown.tera_term),
+            "status_threat_term": round2(breakdown.status_threat_term),
+        },
+    });
+
+    // serde_json::to_string is infallible for json! values built from primitives.
+    let line = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string());
+    log::info!("[ENGINE-INSTRUMENT] {}", line);
+}
+
 fn error_stream_update(msg: String) -> StreamUpdate {
     StreamUpdate {
         event: "error",
@@ -499,13 +597,26 @@ async fn analyze_stream_handler(
 
             // Synthesize the s1 move-name list from the FIRST hypothesis's state.
             // (All K hypotheses share the same player-side team — only opp varies.)
-            let s1_names = match poke_engine::translate::auto_detect_and_parse(&first_hyp_for_names) {
-                Ok(state) => {
-                    let (s1_options, _) = state.root_get_all_options();
-                    s1_options.iter().map(|mc| mc.to_string(&state.side_one)).collect::<Vec<_>>()
-                }
-                Err(_) => Vec::new(),
-            };
+            let (s1_names, s2_names, pimc_breakdown) =
+                match poke_engine::translate::auto_detect_and_parse(&first_hyp_for_names) {
+                    Ok(state) => {
+                        let (s1_options, s2_options) = state.root_get_all_options();
+                        let s1n: Vec<String> = s1_options.iter().map(|mc| mc.to_string(&state.side_one)).collect();
+                        let s2n: Vec<String> = s2_options.iter().map(|mc| mc.to_string(&state.side_two)).collect();
+                        let bd = evaluate_breakdown(&state);
+                        (s1n, s2n, bd)
+                    }
+                    Err(_) => (Vec::new(), Vec::new(), EvalBreakdown::default()),
+                };
+            // [ENGINE-INSTRUMENT] for PIMC aggregated result. Eval breakdown
+            // is from the FIRST hypothesis (same player-side state across K).
+            emit_engine_instrument(
+                &pimc_breakdown,
+                &aggregated,
+                &s1_names,
+                &s2_names,
+                "pimc",
+            );
             let final_update = build_stream_update("final", &aggregated, &s1_names);
             let _ = emit(&tx, &final_update);
             return;
@@ -536,6 +647,13 @@ async fn analyze_stream_handler(
             .iter()
             .map(|mc| mc.to_string(&state.side_one))
             .collect();
+        // Also snapshot s2 names + eval breakdown for the [ENGINE-INSTRUMENT]
+        // log line. State is moved into MctsSearch below, so capture these now.
+        let s2_move_names: Vec<String> = s2_options
+            .iter()
+            .map(|mc| mc.to_string(&state.side_two))
+            .collect();
+        let pre_search_breakdown = evaluate_breakdown(&state);
 
         // MctsSearch owns the State. Cloning is cheap relative to a
         // multi-second MCTS run.
@@ -570,6 +688,16 @@ async fn analyze_stream_handler(
 
         // Final snapshot.
         let snap = search.snapshot(start.elapsed().as_millis() as u64);
+        // [ENGINE-INSTRUMENT] structured log: emit ONE JSON line per request
+        // capturing the root eval breakdown + top-K MCTS branches. This is the
+        // hook the analyst greps for to debug "why did the engine pick X?".
+        emit_engine_instrument(
+            &pre_search_breakdown,
+            &snap,
+            &s1_move_names,
+            &s2_move_names,
+            "single",
+        );
         let final_update = build_stream_update("final", &snap, &s1_move_names);
         let _ = emit(&tx, &final_update);
     });
