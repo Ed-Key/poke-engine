@@ -277,6 +277,73 @@ pub fn predicted_opp_max_damage_against(
     predicted_opp_max_damage_and_priority(state, candidate_idx, perspective).0
 }
 
+/// Returns true if the active Pokemon would be KO'd by opp's predicted
+/// top-damage move AND wouldn't get a move in first.
+///
+/// "Wouldn't get a move in first" = no priority move that beats opp's
+/// predicted move's priority, AND in equal-priority cases, my speed
+/// is <= opp's speed.
+///
+/// Returns false when active has only status moves (we can't compute
+/// "my top damaging priority"; falling back to false avoids triggering
+/// the death penalty for last-ditch Recover plays).
+fn is_definitely_dying(state: &State, perspective: SidePerspective) -> bool {
+    let active_idx = match perspective {
+        SidePerspective::Side1 => state.side_one.active_index,
+        SidePerspective::Side2 => state.side_two.active_index,
+    };
+    let active = match perspective {
+        SidePerspective::Side1 => state.side_one.get_active_immutable(),
+        SidePerspective::Side2 => state.side_two.get_active_immutable(),
+    };
+
+    let (predicted_opp_dmg, opp_priority) =
+        predicted_opp_max_damage_and_priority(state, active_idx, perspective);
+
+    // I die if predicted damage >= my HP
+    let i_die = predicted_opp_dmg >= active.hp;
+    if !i_die {
+        return false;
+    }
+
+    // Find my top legal damaging move's priority
+    let my_top_priority: Option<i8> = active
+        .moves
+        .into_iter()
+        .filter(|m| {
+            !m.disabled
+                && m.pp > 0
+                && m.choice.category != MoveCategory::Status
+                && m.choice.category != MoveCategory::Switch
+        })
+        .map(|m| m.choice.priority)
+        .max();
+
+    // No damaging moves → can't compute, fall back to false (status-only active)
+    let my_top_priority = match my_top_priority {
+        Some(p) => p,
+        None => return false,
+    };
+
+    // Speed comparison
+    let my_side_ref = match perspective {
+        SidePerspective::Side1 => SideReference::SideOne,
+        SidePerspective::Side2 => SideReference::SideTwo,
+    };
+    let opp_side_ref = match perspective {
+        SidePerspective::Side1 => SideReference::SideTwo,
+        SidePerspective::Side2 => SideReference::SideOne,
+    };
+    let my_speed = crate::engine::generate_instructions::get_effective_speed(state, &my_side_ref);
+    let opp_speed = crate::engine::generate_instructions::get_effective_speed(state, &opp_side_ref);
+
+    // I move after if: lower priority OR equal priority + speed <= opp
+    let i_definitely_move_after = my_top_priority < opp_priority
+        || (my_top_priority == opp_priority && my_speed <= opp_speed);
+
+    i_die && i_definitely_move_after
+}
+
 /// Survivability-aware switch picker (Plan I, Fix #1).
 ///
 /// Pre-filters bench candidates that would die on entry (hazards +
@@ -395,6 +462,18 @@ pub fn compute(
     if dmg_pick.is_none() && switch_pick.is_none() {
         return None;
     }
+
+    // Fix #1.6: when active is definitely dying with a viable switch,
+    // shift mass aggressively toward the switch. Without this, the
+    // unallocated mass from `dmg_pick == None` (when no move can fire)
+    // leaks into uniform fill across 8 legal slots (~0.0875 each),
+    // drowning out the switch's 0.3 mass.
+    let (mass_dmg, mass_switch) =
+        if switch_pick.is_some() && is_definitely_dying(state, perspective) {
+            (0.0, 0.9)
+        } else {
+            (mass_dmg, mass_switch)
+        };
 
     let side = match perspective {
         SidePerspective::Side1 => &state.side_one,
