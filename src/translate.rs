@@ -46,6 +46,13 @@ pub struct SideInput {
     pub force_trapped: bool,
     #[serde(default = "default_false")]
     pub force_switch: bool,
+    /// Substitute HP for the active Pokemon. When the SUBSTITUTE
+    /// volatile_status is set but this is None/0, the engine cannot
+    /// model damage absorption correctly. Showdown-side proxies should
+    /// derive this as `active.maxhp / 4` when the sub volatile is
+    /// present (standard sub HP at creation).
+    #[serde(default)]
+    pub substitute_health: Option<i16>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -440,6 +447,7 @@ fn fabric_aux_side_to_input(side: &FabricAuxSide) -> SideInput {
         boosts,
         force_trapped: false,
         force_switch: false,
+        substitute_health: None,
     }
 }
 
@@ -458,6 +466,7 @@ pub fn from_fabric_aux(state: &FabricAuxState) -> State {
             boosts: None,
             force_trapped: false,
             force_switch: false,
+            substitute_health: None,
         }
     };
 
@@ -472,6 +481,7 @@ pub fn from_fabric_aux(state: &FabricAuxState) -> State {
             boosts: None,
             force_trapped: false,
             force_switch: false,
+            substitute_health: None,
         }
     };
 
@@ -765,7 +775,7 @@ fn serialize_side(side: &SideInput) -> String {
         side_conditions,            // [7]
         volatile_statuses,          // [8]
         volatile_durations,         // [9]
-        0,                          // [10] substitute_health
+        side.substitute_health.unwrap_or(0), // [10] substitute_health
         atk_b,                      // [11]
         def_b,                      // [12]
         spa_b,                      // [13]
