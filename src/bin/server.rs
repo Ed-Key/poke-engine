@@ -55,6 +55,24 @@ pub struct Cli {
     /// PUCT exploration constant. AlphaZero default is 1.25.
     #[arg(long, env = "POKE_ENGINE_C_PUCT", default_value_t = 1.25)]
     pub c_puct: f32,
+
+    /// Plan I: heuristic prior mix weight (`λ`). 0.0 = pure NN policy
+    /// (default; current production behavior). 0.1 = recommended after A/B.
+    #[arg(long, env = "POKE_ENGINE_HEURISTIC_MIX", default_value_t = 0.0)]
+    pub heuristic_prior_mix: f32,
+
+    /// Plan I: KataGo Forced Playouts constant. 0.0 = disabled (default).
+    /// 2.0 = KataGo's published value.
+    #[arg(long, env = "POKE_ENGINE_FORCED_C", default_value_t = 0.0)]
+    pub forced_playouts_c: f32,
+
+    /// Plan I: heuristic prior mass on damage-calc top move slot.
+    #[arg(long, default_value_t = 0.6)]
+    pub heuristic_prior_mass_dmg: f32,
+
+    /// Plan I: heuristic prior mass on matchup-switch slot.
+    #[arg(long, default_value_t = 0.3)]
+    pub heuristic_prior_mass_switch: f32,
 }
 
 /// Shared per-process state plumbed through axum handlers.
@@ -65,6 +83,14 @@ pub struct Cli {
 pub struct AppState {
     pub eval_kind: EvalKind,
     pub c_puct: f32,
+    /// Plan I: heuristic prior mix weight (`λ`). 0.0 → bit-identical to pre-Plan-I.
+    pub heuristic_prior_mix: f32,
+    /// Plan I: KataGo Forced Playouts constant. 0.0 → disabled.
+    pub forced_playouts_c: f32,
+    /// Plan I: heuristic prior mass on damage-calc top move slot.
+    pub heuristic_prior_mass_dmg: f32,
+    /// Plan I: heuristic prior mass on matchup-switch slot.
+    pub heuristic_prior_mass_switch: f32,
 }
 
 // -- Request / Response types --
@@ -201,6 +227,12 @@ async fn analyze_handler(
     let raw_json = body;
     let eval_kind = app.eval_kind.clone();
     let c_puct = app.c_puct;
+    // Plan I: capture mix/mass/forced-playouts knobs into the closure.
+    // All four are f32 (Copy), so this is a cheap by-value capture.
+    let heuristic_prior_mix = app.heuristic_prior_mix;
+    let forced_playouts_c = app.forced_playouts_c;
+    let heuristic_prior_mass_dmg = app.heuristic_prior_mass_dmg;
+    let heuristic_prior_mass_switch = app.heuristic_prior_mass_switch;
 
     // Translate to poke-engine State — catch panics from deserialization.
     // NN client calls happen inside this spawn_blocking thread, NEVER from
@@ -223,15 +255,70 @@ async fn analyze_handler(
             .map(|mc| mc.to_string(&state.side_one))
             .collect();
 
-        // Run MCTS via the Plan E entry point (handles NN dispatch + PUCT).
+        // Plan I: when blending is requested AND we're in NN mode, fetch the
+        // raw NN policy ourselves, blend with the heuristic prior, and pass
+        // the result through `new_with_priors`. Otherwise fall through to the
+        // original `new_with_eval` path — bit-identical to pre-Plan-I when
+        // both mix and forced-playouts are at their 0.0 defaults.
         let start = Instant::now();
-        let mut search = MctsSearch::new_with_eval(
-            state,
-            s1_options,
-            s2_options,
-            &eval_kind,
-            c_puct,
-        );
+        let use_blended = heuristic_prior_mix > 0.0 && eval_kind.uses_nn();
+        let mut search = if use_blended {
+            // SAFETY of unwrap: `uses_nn()` guarantees the EvalKind::Nn arm.
+            let client = match &eval_kind {
+                poke_engine::eval_kind::EvalKind::Nn(c) => c.clone(),
+                _ => unreachable!("guarded by uses_nn() above"),
+            };
+            let heuristic = poke_engine::heuristic_prior::compute(
+                &state,
+                poke_engine::nn_state_encoder::SidePerspective::Side1,
+                &s1_options,
+                heuristic_prior_mass_dmg,
+                heuristic_prior_mass_switch,
+            );
+            let s1_priors_blended = {
+                let json = poke_engine::nn_state_encoder::encode(
+                    &state,
+                    poke_engine::nn_state_encoder::SidePerspective::Side1,
+                );
+                match client.policy(&json, poke_engine::nn_client::Perspective::P1) {
+                    Ok(resp) => Some(
+                        poke_engine::nn_state_encoder::map_policy_to_options_blended(
+                            &resp.probs,
+                            &state,
+                            poke_engine::nn_state_encoder::SidePerspective::Side1,
+                            &s1_options,
+                            heuristic.as_ref(),
+                            heuristic_prior_mix,
+                        ),
+                    ),
+                    Err(e) => {
+                        log::warn!(
+                            "NN client failed at root (Plan I blended path): {} — falling back to uniform priors",
+                            e
+                        );
+                        None
+                    }
+                }
+            };
+            MctsSearch::new_with_priors(
+                state,
+                s1_options,
+                s2_options,
+                c_puct,
+                s1_priors_blended,
+                None,
+            )
+        } else {
+            MctsSearch::new_with_eval(
+                state,
+                s1_options,
+                s2_options,
+                &eval_kind,
+                c_puct,
+            )
+        };
+        // Plan I: forced-playouts root constant. 0.0 (default) is a no-op.
+        search.set_c_forced(forced_playouts_c);
         search.run_for(Duration::from_millis(time_limit_ms));
         let mcts_result = search.snapshot(start.elapsed().as_millis() as u64);
         let elapsed_ms = start.elapsed().as_millis() as u64;
@@ -761,6 +848,10 @@ async fn main() {
     let app_state = AppState {
         eval_kind,
         c_puct: cli.c_puct,
+        heuristic_prior_mix: cli.heuristic_prior_mix,
+        forced_playouts_c: cli.forced_playouts_c,
+        heuristic_prior_mass_dmg: cli.heuristic_prior_mass_dmg,
+        heuristic_prior_mass_switch: cli.heuristic_prior_mass_switch,
     };
 
     // Permissive CORS: server is localhost-only, no security concern.
