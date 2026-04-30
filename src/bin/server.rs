@@ -254,6 +254,18 @@ async fn analyze_handler(
             .iter()
             .map(|mc| mc.to_string(&state.side_one))
             .collect();
+        // Plan I (Task 9 telemetry): also snapshot s2 move names + the
+        // pre-search eval breakdown for the [ENGINE-INSTRUMENT] line. State
+        // is moved into MctsSearch below, so capture these now. We also keep
+        // a clone of state and s1_options for later prior-mapping.
+        let s2_move_names: Vec<String> = s2_options
+            .iter()
+            .map(|mc| mc.to_string(&state.side_two))
+            .collect();
+        let pre_search_breakdown = evaluate_breakdown(&state);
+        let state_for_telemetry = state.clone();
+        let s1_options_for_telemetry: Vec<poke_engine::engine::state::MoveChoice> =
+            s1_options.clone();
 
         // Plan I: when blending is requested AND we're in NN mode, fetch the
         // raw NN policy ourselves, blend with the heuristic prior, and pass
@@ -262,6 +274,11 @@ async fn analyze_handler(
         // both mix and forced-playouts are at their 0.0 defaults.
         let start = Instant::now();
         let use_blended = heuristic_prior_mix > 0.0 && eval_kind.uses_nn();
+        // Plan I telemetry captures (Task 9): populated only on the blended
+        // path; default-off requests keep them empty / None.
+        let mut telemetry_raw_nn_probs: Vec<f32> = Vec::new();
+        let mut telemetry_heuristic: Option<poke_engine::heuristic_prior::HeuristicPrior> = None;
+        let mut telemetry_s1_priors_blended: Vec<f32> = Vec::new();
         let mut search = if use_blended {
             // SAFETY of unwrap: `uses_nn()` guarantees the EvalKind::Nn arm.
             let client = match &eval_kind {
@@ -281,16 +298,21 @@ async fn analyze_handler(
                     poke_engine::nn_state_encoder::SidePerspective::Side1,
                 );
                 match client.policy(&json, poke_engine::nn_client::Perspective::P1) {
-                    Ok(resp) => Some(
-                        poke_engine::nn_state_encoder::map_policy_to_options_blended(
+                    Ok(resp) => {
+                        // Plan I telemetry: capture the raw NN policy BEFORE
+                        // we hand `resp.probs` to map_policy_to_options_blended.
+                        telemetry_raw_nn_probs = resp.probs.clone();
+                        let blended = poke_engine::nn_state_encoder::map_policy_to_options_blended(
                             &resp.probs,
                             &state,
                             poke_engine::nn_state_encoder::SidePerspective::Side1,
                             &s1_options,
                             heuristic.as_ref(),
                             heuristic_prior_mix,
-                        ),
-                    ),
+                        );
+                        telemetry_s1_priors_blended = blended.clone();
+                        Some(blended)
+                    }
                     Err(e) => {
                         log::warn!(
                             "NN client failed at root (Plan I blended path): {} — falling back to uniform priors",
@@ -300,6 +322,7 @@ async fn analyze_handler(
                     }
                 }
             };
+            telemetry_heuristic = heuristic;
             MctsSearch::new_with_priors(
                 state,
                 s1_options,
@@ -322,6 +345,25 @@ async fn analyze_handler(
         search.run_for(Duration::from_millis(time_limit_ms));
         let mcts_result = search.snapshot(start.elapsed().as_millis() as u64);
         let elapsed_ms = start.elapsed().as_millis() as u64;
+
+        // Plan I (Task 9): emit ONE [ENGINE-INSTRUMENT] line per /analyze
+        // request, populated with telemetry when the blended path ran.
+        let telemetry = InstrumentTelemetry {
+            raw_nn_probs: &telemetry_raw_nn_probs,
+            heuristic: telemetry_heuristic.as_ref(),
+            s1_priors_blended: &telemetry_s1_priors_blended,
+            forced_playouts_triggered: search.forced_playouts_triggered,
+            state: Some(&state_for_telemetry),
+            s1_options: &s1_options_for_telemetry,
+        };
+        emit_engine_instrument(
+            &pre_search_breakdown,
+            &mcts_result,
+            &s1_move_names,
+            &s2_move_names,
+            "analyze",
+            &telemetry,
+        );
 
         // Process side-one results: pair with move names, sort by visits descending
         let mut scored: Vec<(String, f32, u32)> = mcts_result
@@ -473,6 +515,64 @@ fn build_stream_update(
     }
 }
 
+/// Plan I telemetry inputs for the `[ENGINE-INSTRUMENT]` log line. All fields
+/// are optional / empty in the default-off path (no NN, no heuristic mix);
+/// the consumer treats empty raw_nn_probs as "no NN this request" and emits
+/// 0.0 entropy / top1 / null picks / [] blend table.
+pub struct InstrumentTelemetry<'a> {
+    /// Raw 13-slot NN policy from the sidecar (alphabetical convention).
+    /// Empty when the request didn't go through the NN-blended path.
+    pub raw_nn_probs: &'a [f32],
+    /// Heuristic prior result, if computed for this request.
+    pub heuristic: Option<&'a poke_engine::heuristic_prior::HeuristicPrior>,
+    /// Blended priors in the same order as `s1_options` (and therefore the
+    /// same order as `s1_move_names`). Empty when not blended.
+    pub s1_priors_blended: &'a [f32],
+    /// Forced-playouts trigger count from the search.
+    pub forced_playouts_triggered: u32,
+    /// The state at root — needed to recompute the per-option NN priors via
+    /// `map_policy_to_options` for the prior_blend_per_top5 join.
+    pub state: Option<&'a poke_engine::state::State>,
+    /// The s1 options at root, in the same order as `s1_move_names`. Used
+    /// alongside `state` to call `map_policy_to_options`.
+    pub s1_options: &'a [poke_engine::engine::state::MoveChoice],
+}
+
+impl<'a> InstrumentTelemetry<'a> {
+    /// Default-off telemetry: no NN, no heuristic, all empty / zero. Used in
+    /// code paths that don't (yet) participate in the Plan I blended pipeline
+    /// (PIMC aggregator, streaming single-search) so they still produce valid
+    /// log lines.
+    pub fn empty(forced_playouts_triggered: u32) -> Self {
+        Self {
+            raw_nn_probs: &[],
+            heuristic: None,
+            s1_priors_blended: &[],
+            forced_playouts_triggered,
+            state: None,
+            s1_options: &[],
+        }
+    }
+}
+
+/// Shannon entropy of a probability distribution (natural log). Treats
+/// p == 0 as 0 contribution (`0 * log 0 := 0`). Returns 0.0 on empty input.
+/// We add 0.0 at the end to normalize any signed-zero artifacts that arise
+/// from `-p * ln(p)` for p just above zero.
+fn policy_entropy(probs: &[f32]) -> f32 {
+    let h: f32 = probs
+        .iter()
+        .filter(|p| **p > 0.0)
+        .map(|p| -p * p.ln())
+        .sum();
+    h + 0.0
+}
+
+/// Top-1 probability mass. Returns 0.0 on empty input.
+fn policy_top1(probs: &[f32]) -> f32 {
+    probs.iter().cloned().fold(0.0_f32, f32::max)
+}
+
 /// Emit a single-line `[ENGINE-INSTRUMENT]` JSON log with the eval breakdown
 /// + top-5 s1 / top-3 s2 MCTS branches (visits, avg value, prior). Designed
 /// to be greppable from `~/plan-e-engine-*.log` for post-hoc diagnostics of
@@ -483,12 +583,18 @@ fn build_stream_update(
 /// so visit counts are populated. JSON is kept under ~1KB by truncating to
 /// top-5/top-3 with rounded floats. If the result has 0 sims, we still emit
 /// (with an empty branches array) — silence is worse than empty.
+///
+/// Plan I additions (Task 9): `policy_entropy`, `policy_top1_prob`,
+/// `forced_playouts_triggered`, `heuristic_pick_dmg`, `heuristic_pick_switch`,
+/// `prior_blend_per_top5`. All six are populated from `telemetry`; default-off
+/// requests pass an `empty()` telemetry and get neutral values.
 fn emit_engine_instrument(
     breakdown: &EvalBreakdown,
     mcts_result: &MctsResult,
     s1_move_names: &[String],
     s2_move_names: &[String],
     label: &str,
+    telemetry: &InstrumentTelemetry<'_>,
 ) {
     fn round2(x: f32) -> f32 {
         // Round to 2 decimals to keep log lines compact and stable.
@@ -497,6 +603,23 @@ fn emit_engine_instrument(
     fn round4(x: f32) -> f32 {
         (x * 10000.0).round() / 10000.0
     }
+
+    // Plan I: precompute the per-option NN priors (in s1_options order) so we
+    // can join them with my_top5 below. Empty when this request didn't query
+    // the NN (default-off path).
+    let raw_nn_priors_in_options_order: Vec<f32> = if !telemetry.raw_nn_probs.is_empty()
+        && telemetry.state.is_some()
+        && !telemetry.s1_options.is_empty()
+    {
+        poke_engine::nn_state_encoder::map_policy_to_options(
+            telemetry.raw_nn_probs,
+            telemetry.state.unwrap(),
+            poke_engine::nn_state_encoder::SidePerspective::Side1,
+            telemetry.s1_options,
+        )
+    } else {
+        Vec::new()
+    };
 
     // Sort s1 by visits desc, take top 5.
     let mut s1_idx: Vec<usize> = (0..mcts_result.s1.len()).collect();
@@ -524,6 +647,36 @@ fn emit_engine_instrument(
         })
         .collect();
 
+    // Plan I: per-top-5 raw NN prior + blended prior, joined by option index.
+    // Both `raw_nn_priors_in_options_order` and `telemetry.s1_priors_blended`
+    // are indexed in s1_options order, which is the same order s1_move_names
+    // (and mcts_result.s1) uses. So `i` from s1_idx is the join key directly.
+    let prior_blend_per_top5: Vec<serde_json::Value> = if raw_nn_priors_in_options_order.is_empty()
+        || telemetry.s1_priors_blended.is_empty()
+    {
+        Vec::new()
+    } else {
+        s1_idx
+            .iter()
+            .take(5)
+            .map(|&i| {
+                let r = &mcts_result.s1[i];
+                let name = s1_move_names
+                    .get(i)
+                    .cloned()
+                    .unwrap_or_else(|| format!("{:?}", r.move_choice))
+                    .to_uppercase();
+                let prior_nn = raw_nn_priors_in_options_order.get(i).copied().unwrap_or(0.0);
+                let prior_blended = telemetry.s1_priors_blended.get(i).copied().unwrap_or(0.0);
+                serde_json::json!({
+                    "move": name,
+                    "prior_nn": round4(prior_nn),
+                    "prior_blended": round4(prior_blended),
+                })
+            })
+            .collect()
+    };
+
     let mut s2_idx: Vec<usize> = (0..mcts_result.s2.len()).collect();
     s2_idx.sort_by(|a, b| mcts_result.s2[*b].visits.cmp(&mcts_result.s2[*a].visits));
     let opp_top3: Vec<serde_json::Value> = s2_idx
@@ -545,6 +698,15 @@ fn emit_engine_instrument(
         })
         .collect();
 
+    // Plan I: heuristic pick names. `Option<&HeuristicPrior>` -> Option<String>.
+    // We use Debug for Choices / PokemonName; serde_json renders None as null.
+    let heuristic_pick_dmg: Option<String> = telemetry
+        .heuristic
+        .and_then(|h| h.damage_calc_pick.as_ref().map(|c| format!("{:?}", c)));
+    let heuristic_pick_switch: Option<String> = telemetry
+        .heuristic
+        .and_then(|h| h.matchup_switch_pick.as_ref().map(|p| format!("{:?}", p)));
+
     let payload = serde_json::json!({
         "label": label,
         "sims": mcts_result.iteration_count,
@@ -563,6 +725,13 @@ fn emit_engine_instrument(
             "tera_term": round2(breakdown.tera_term),
             "status_threat_term": round2(breakdown.status_threat_term),
         },
+        // Plan I telemetry fields. Default-off path emits 0.0 / null / [].
+        "policy_entropy": round4(policy_entropy(telemetry.raw_nn_probs)),
+        "policy_top1_prob": round4(policy_top1(telemetry.raw_nn_probs)),
+        "forced_playouts_triggered": telemetry.forced_playouts_triggered,
+        "heuristic_pick_dmg": heuristic_pick_dmg,
+        "heuristic_pick_switch": heuristic_pick_switch,
+        "prior_blend_per_top5": prior_blend_per_top5,
     });
 
     // serde_json::to_string is infallible for json! values built from primitives.
@@ -697,12 +866,15 @@ async fn analyze_stream_handler(
                 };
             // [ENGINE-INSTRUMENT] for PIMC aggregated result. Eval breakdown
             // is from the FIRST hypothesis (same player-side state across K).
+            // PIMC path doesn't (yet) participate in Plan I blending — pass
+            // empty telemetry so the new fields are present-but-neutral.
             emit_engine_instrument(
                 &pimc_breakdown,
                 &aggregated,
                 &s1_names,
                 &s2_names,
                 "pimc",
+                &InstrumentTelemetry::empty(0),
             );
             let final_update = build_stream_update("final", &aggregated, &s1_names);
             let _ = emit(&tx, &final_update);
@@ -778,12 +950,16 @@ async fn analyze_stream_handler(
         // [ENGINE-INSTRUMENT] structured log: emit ONE JSON line per request
         // capturing the root eval breakdown + top-K MCTS branches. This is the
         // hook the analyst greps for to debug "why did the engine pick X?".
+        // Streaming path doesn't (yet) thread Plan I blending — pass empty
+        // telemetry but propagate the search's forced-playouts counter so the
+        // field is meaningful even when c_forced > 0 in this path.
         emit_engine_instrument(
             &pre_search_breakdown,
             &snap,
             &s1_move_names,
             &s2_move_names,
             "single",
+            &InstrumentTelemetry::empty(search.forced_playouts_triggered),
         );
         let final_update = build_stream_update("final", &snap, &s1_move_names);
         let _ = emit(&tx, &final_update);

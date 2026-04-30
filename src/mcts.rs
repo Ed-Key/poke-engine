@@ -108,20 +108,25 @@ impl Node {
     /// short-circuit in `MoveNode::should_force_visit` ensures this method
     /// returns the same index as `maximize_puct_for_side` — bit-identical
     /// to today's behavior.
+    ///
+    /// Returns `(child_index, force_visit_fired)`. `force_visit_fired` is
+    /// true iff a child was selected by the forced-playouts branch (so the
+    /// caller can update the Plan I telemetry counter). When `c_forced` is
+    /// 0.0 the bool is always false.
     pub fn maximize_with_forced_playouts(
         &self,
         side_map: &[MoveNode],
         c_puct: f32,
         c_forced: f32,
-    ) -> usize {
+    ) -> (usize, bool) {
         if c_forced > 0.0 {
             for (index, node) in side_map.iter().enumerate() {
                 if node.should_force_visit(self.times_visited, c_forced) {
-                    return index;
+                    return (index, true);
                 }
             }
         }
-        self.maximize_puct_for_side(side_map, c_puct)
+        (self.maximize_puct_for_side(side_map, c_puct), false)
     }
 
     pub unsafe fn selection(
@@ -129,6 +134,7 @@ impl Node {
         state: &mut State,
         c_puct: f32,
         c_forced: f32,
+        forced_counter: &mut u32,
     ) -> (*mut Node, usize, usize) {
         let return_node = self as *mut Node;
         if self.s1_options.is_none() {
@@ -141,18 +147,24 @@ impl Node {
         // Plan I: forced playouts apply at ROOT only. In-tree selection uses
         // pure PUCT — pass c_forced=0.0 down so should_force_visit short-circuits.
         let (s1_mc_index, s2_mc_index) = if self.root {
-            (
-                self.maximize_with_forced_playouts(
-                    self.s1_options.as_ref().unwrap(),
-                    c_puct,
-                    c_forced,
-                ),
-                self.maximize_with_forced_playouts(
-                    self.s2_options.as_ref().unwrap(),
-                    c_puct,
-                    c_forced,
-                ),
-            )
+            let (s1_idx, s1_forced) = self.maximize_with_forced_playouts(
+                self.s1_options.as_ref().unwrap(),
+                c_puct,
+                c_forced,
+            );
+            let (s2_idx, s2_forced) = self.maximize_with_forced_playouts(
+                self.s2_options.as_ref().unwrap(),
+                c_puct,
+                c_forced,
+            );
+            // Plan I telemetry: increment once if the root iteration was
+            // overridden by forced-playouts on EITHER side. Counts at most
+            // one fire per iteration (matches the spec's per-iteration
+            // semantics, not per-side).
+            if s1_forced || s2_forced {
+                *forced_counter = forced_counter.saturating_add(1);
+            }
+            (s1_idx, s2_idx)
         } else {
             (
                 self.maximize_puct_for_side(self.s1_options.as_ref().unwrap(), c_puct),
@@ -165,7 +177,7 @@ impl Node {
                 let child_vec_ptr = child_vector as *mut Vec<Node>;
                 let chosen_child = self.sample_node(child_vec_ptr);
                 state.apply_instructions(&(*chosen_child).instructions.instruction_list);
-                (*chosen_child).selection(state, c_puct, c_forced)
+                (*chosen_child).selection(state, c_puct, c_forced, forced_counter)
             }
             None => (return_node, s1_mc_index, s2_mc_index),
         }
@@ -346,9 +358,10 @@ fn do_mcts(
     root_eval: &f32,
     c_puct: f32,
     c_forced: f32,
+    forced_counter: &mut u32,
 ) {
     let (mut new_node, s1_move, s2_move) =
-        unsafe { root_node.selection(state, c_puct, c_forced) };
+        unsafe { root_node.selection(state, c_puct, c_forced, forced_counter) };
     new_node = unsafe { (*new_node).expand(state, s1_move, s2_move) };
     let rollout_result = unsafe { (*new_node).rollout(state, root_eval) };
     unsafe { (*new_node).backpropagate(rollout_result, state) }
@@ -457,6 +470,10 @@ pub struct MctsSearch {
     /// KataGo's published default. Used at root selection only —
     /// in-tree selection (depth >= 1) ignores this.
     pub c_forced: f32,
+    /// Plan I telemetry: count of root selection iterations where Forced
+    /// Playouts overrode PUCT-max on either side. With `c_forced == 0.0`
+    /// this stays at 0 forever (force-visit never fires).
+    pub forced_playouts_triggered: u32,
 }
 
 impl MctsSearch {
@@ -557,6 +574,7 @@ impl MctsSearch {
             // Plan I: forced-playouts disabled by default. Existing tests
             // and CLI behavior are bit-identical until set_c_forced is called.
             c_forced: 0.0,
+            forced_playouts_triggered: 0,
         }
     }
 
@@ -584,6 +602,7 @@ impl MctsSearch {
                     &self.root_eval,
                     self.c_puct,
                     self.c_forced,
+                    &mut self.forced_playouts_triggered,
                 );
             }
 
