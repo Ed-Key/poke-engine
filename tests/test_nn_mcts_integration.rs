@@ -205,3 +205,115 @@ fn iron_crown_t5_nn_picks_earthquake() {
 
     eprintln!("=== Iron Crown T5 PASSED ===");
 }
+
+use poke_engine::heuristic_prior::HeuristicPrior;
+use poke_engine::nn_state_encoder::{map_policy_to_options, map_policy_to_options_blended, SidePerspective};
+
+fn make_4_move_state() -> (poke_engine::state::State, Vec<poke_engine::engine::state::MoveChoice>) {
+    // Garchomp 4-move setup — alphabetical: dragonclaw, earthquake,
+    // stoneedge, swordsdance → slots 0..3.
+    // Tera banned + reserves fainted so options.len() == 4 exactly
+    // (no MoveTera variants, no Switch options).
+    let mut state = poke_engine::state::State::default();
+    state.tera_banned = true;
+    // Faint all reserve slots P1..P5 on side one to suppress Switch options.
+    for idx in [
+        poke_engine::state::PokemonIndex::P1,
+        poke_engine::state::PokemonIndex::P2,
+        poke_engine::state::PokemonIndex::P3,
+        poke_engine::state::PokemonIndex::P4,
+        poke_engine::state::PokemonIndex::P5,
+    ] {
+        state.side_one.pokemon[idx].hp = 0;
+    }
+    state.side_one.get_active().id = poke_engine::pokemon::PokemonName::GARCHOMP;
+    state.side_one.get_active().attack = 359;
+    state.side_one.get_active().replace_move(
+        poke_engine::state::PokemonMoveIndex::M0,
+        poke_engine::choices::Choices::DRAGONCLAW,
+    );
+    state.side_one.get_active().replace_move(
+        poke_engine::state::PokemonMoveIndex::M1,
+        poke_engine::choices::Choices::EARTHQUAKE,
+    );
+    state.side_one.get_active().replace_move(
+        poke_engine::state::PokemonMoveIndex::M2,
+        poke_engine::choices::Choices::STONEEDGE,
+    );
+    state.side_one.get_active().replace_move(
+        poke_engine::state::PokemonMoveIndex::M3,
+        poke_engine::choices::Choices::SWORDSDANCE,
+    );
+    let (s1, _) = state.root_get_all_options();
+    (state, s1)
+}
+
+#[test]
+fn map_policy_blended_lambda_zero_returns_pure_nn() {
+    let (state, opts) = make_4_move_state();
+    let mut probs = [0.0f32; 13];
+    probs[0] = 0.97;
+    probs[1] = 0.01;
+    probs[2] = 0.01;
+    probs[3] = 0.01;
+
+    let mut h = [0.0f32; 13];
+    h[1] = 1.0;
+    let heuristic = HeuristicPrior {
+        probs: h,
+        damage_calc_pick: None,
+        matchup_switch_pick: None,
+    };
+
+    let baseline = map_policy_to_options(&probs, &state, SidePerspective::Side1, &opts);
+    let blended = map_policy_to_options_blended(
+        &probs, &state, SidePerspective::Side1, &opts,
+        Some(&heuristic), 0.0, // lambda_mix = 0 → pure NN, bit-identical
+    );
+
+    for (i, (a, b)) in baseline.iter().zip(blended.iter()).enumerate() {
+        assert!(
+            (a - b).abs() < 1e-5,
+            "lambda=0 should match map_policy_to_options at slot {}: baseline={} blended={}",
+            i, a, b
+        );
+    }
+}
+
+#[test]
+fn map_policy_blended_lifts_alternative_above_nn_floor() {
+    let (state, opts) = make_4_move_state();
+    let mut probs = [0.0f32; 13];
+    probs[0] = 0.97; // dragonclaw — peaked NN
+    probs[1] = 0.01; // earthquake (alternative)
+    probs[2] = 0.01;
+    probs[3] = 0.01;
+
+    let mut h = [0.0f32; 13];
+    h[1] = 0.6;
+    h[2] = 0.3;
+    h[0] = 0.05;
+    h[3] = 0.05;
+    let heuristic = HeuristicPrior {
+        probs: h,
+        damage_calc_pick: None,
+        matchup_switch_pick: None,
+    };
+
+    let blended = map_policy_to_options_blended(
+        &probs, &state, SidePerspective::Side1, &opts,
+        Some(&heuristic), 0.1, // 10% heuristic, 90% NN
+    );
+
+    // Top NN value (dragonclaw, 0.97) gets diluted: 0.9*0.97 + 0.1*0.05 = 0.878.
+    let max_blended = blended.iter().cloned().fold(0.0f32, f32::max);
+    assert!(max_blended < 0.99, "post-blend top must be < 0.99 (was peaked NN); got {}", max_blended);
+
+    // No slot should be starved below 0.005 post-blend.
+    let min_blended = blended.iter().cloned().fold(1.0f32, f32::min);
+    assert!(
+        min_blended >= 0.005,
+        "no slot should be starved below 0.005 post-blend; got {}",
+        min_blended
+    );
+}

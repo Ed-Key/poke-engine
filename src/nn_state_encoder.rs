@@ -372,6 +372,41 @@ pub fn map_policy_to_options(
     priors
 }
 
+/// Variant of `map_policy_to_options` that optionally blends an external
+/// heuristic prior with the NN policy before mapping to options.
+///
+/// Final per-slot prior is `(1-λ)·P_NN + λ·P_heuristic`, then mapped to
+/// the options list using the same alphabetical-slot logic.
+///
+/// When `heuristic` is `None` or `lambda_mix <= 0.0`, returns the same
+/// result as `map_policy_to_options(probs, state, perspective, options)`
+/// bit-identically (regression guard for the default-off CLI flag).
+///
+/// `lambda_mix` is clamped to `[0.0, 1.0]`.
+pub fn map_policy_to_options_blended(
+    probs: &[f32],
+    state: &State,
+    perspective: SidePerspective,
+    options: &[MoveChoice],
+    heuristic: Option<&crate::heuristic_prior::HeuristicPrior>,
+    lambda_mix: f32,
+) -> Vec<f32> {
+    if heuristic.is_none() || lambda_mix <= 0.0 {
+        return map_policy_to_options(probs, state, perspective, options);
+    }
+    let h = heuristic.unwrap();
+    let lam = lambda_mix.clamp(0.0, 1.0);
+
+    let mut blended = [0.0_f32; ACTION_DIM];
+    for i in 0..ACTION_DIM {
+        let nn = probs.get(i).copied().unwrap_or(0.0);
+        let hp = h.probs[i];
+        blended[i] = (1.0 - lam) * nn + lam * hp;
+    }
+
+    map_policy_to_options(&blended, state, perspective, options)
+}
+
 /// Return the 4 move IDs (raw `Choices` debug strings, lowercase) for the
 /// active Pokemon — including blank slots so the indexing matches `M0..M3`.
 pub(crate) fn active_move_ids(p: &Pokemon) -> Vec<String> {
