@@ -527,8 +527,11 @@ impl MctsSearch {
     /// at the root to derive the s1 prior. On any sidecar failure, logs a
     /// warning and falls back to uniform priors (heuristic baseline).
     ///
-    /// `s2_priors` are uniform in NN mode — Kakuna is one-sided; we don't
-    /// model the opponent's policy.
+    /// `s2_priors` are uniform in this entry point. The Plan I Side2 extension
+    /// (Bug #3 fix) blends the heuristic prior with a uniform baseline on opp
+    /// side via `analyze_handler` / `analyze_stream_handler` (see server.rs);
+    /// activated by `--heuristic-prior-mix-side2 > 0.0`. None preserves
+    /// Plan I Side1-only behavior. No NN on opp side per Plan E rationale.
     pub fn new_with_eval(
         state: State,
         s1_options: Vec<MoveChoice>,
