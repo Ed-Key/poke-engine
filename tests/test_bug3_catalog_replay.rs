@@ -131,11 +131,24 @@ fn run_scenario(state: State, mix_side2: f32) -> Vec<String> {
     // move names. `MoveChoice::to_string` produces lowercase (e.g.
     // "woodhammer", "rillaboom" for switches). We uppercase to match the
     // canonical Choices debug spelling used in assertions.
+    //
+    // Strip variant suffixes (-tera, -mega, etc.) so MoveTera/MoveMega
+    // variants collapse to their base move name. T9 catalog assertions
+    // compare against base move names like "WOODHAMMER" or "TERASTARSTORM";
+    // without this, "WOODHAMMER-TERA" would miss a `m == "WOODHAMMER"`
+    // check. Note: this can produce duplicates in the top-3 when both a
+    // base move and its tera-variant are visited (e.g.
+    // ["WOODHAMMER", "WOODHAMMER", "UTURN"]) — that's accurate for catalog
+    // hit detection (the move was clicked, regardless of tera state) so
+    // we keep duplicates rather than dedup.
     let mut s2 = snap.s2.clone();
     s2.sort_by(|a, b| b.visits.cmp(&a.visits));
     s2.iter()
         .take(3)
-        .map(|r| r.move_choice.to_string(&side_two_snapshot).to_uppercase())
+        .map(|r| {
+            let raw = r.move_choice.to_string(&side_two_snapshot).to_uppercase();
+            raw.split('-').next().unwrap_or(&raw).to_string()
+        })
         .collect()
 }
 
