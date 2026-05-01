@@ -605,3 +605,94 @@ pub fn compute(
         matchup_switch_pick: switch_pick,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::{PokemonMoveIndex, State};
+
+    /// Side2 perspective: opp's active has a damaging move that should
+    /// OHKO my active. The heuristic must surface that move as the top
+    /// damage pick (not return None or pick a switch).
+    ///
+    /// Synthetic: my Tyranitar (Rock/Dark) full HP on Side1; opp Keldeo
+    /// (Water/Fighting) full HP on Side2, Hydro Pump in moveset.
+    /// Hydro Pump (Water 110 BP) on Tyranitar: 2x SE -> ~near-OHKO.
+    /// We assert the Side2-perspective heuristic picks HYDROPUMP and
+    /// concentrates probability mass on that slot.
+    #[test]
+    fn test_compute_side2_opp_has_ohko_move() {
+        let mut state = State::default();
+
+        // Side1 (my): Tyranitar — Rock/Dark, decent bulk so Keldeo's
+        // Hydro Pump is the obviously best damage pick on Side2.
+        state.side_one.get_active().id = PokemonName::TYRANITAR;
+        state.side_one.get_active().types = (PokemonType::ROCK, PokemonType::DARK);
+        state.side_one.get_active().hp = 341;
+        state.side_one.get_active().maxhp = 341;
+        state.side_one.get_active().defense = 256;
+        state.side_one.get_active().special_defense = 236;
+
+        // Side2 (opp): Keldeo with HYDROPUMP + filler moves.
+        state.side_two.get_active().id = PokemonName::KELDEO;
+        state.side_two.get_active().types =
+            (PokemonType::WATER, PokemonType::FIGHTING);
+        state.side_two.get_active().hp = 323;
+        state.side_two.get_active().maxhp = 323;
+        state.side_two.get_active().special_attack = 357;
+        // NOTE: SECRETSWORD (Fighting) is intentionally OMITTED — Tyranitar
+        // is 4x weak to Fighting, so SECRETSWORD would out-damage HYDROPUMP
+        // and steal the top-pick assertion. We want HYDROPUMP (2x SE on
+        // Rock/Dark) to be unambiguously the top damage move for this test.
+        state
+            .side_two
+            .get_active()
+            .replace_move(PokemonMoveIndex::M0, Choices::HYDROPUMP);
+        state
+            .side_two
+            .get_active()
+            .replace_move(PokemonMoveIndex::M1, Choices::ICYWIND);
+        state
+            .side_two
+            .get_active()
+            .replace_move(PokemonMoveIndex::M2, Choices::CALMMIND);
+        state
+            .side_two
+            .get_active()
+            .replace_move(PokemonMoveIndex::M3, Choices::SUBSTITUTE);
+
+        let (_, s2_options) = state.root_get_all_options();
+        assert!(!s2_options.is_empty(), "opp must have legal options");
+
+        let result = compute(
+            &state,
+            SidePerspective::Side2,
+            &s2_options,
+            /* mass_dmg */ 0.7,
+            /* mass_switch */ 0.3,
+        );
+
+        let h = result
+            .expect("heuristic should produce a prior when damage move exists");
+
+        // damage_calc_top_move should pick HYDROPUMP for opp.
+        let dmg_pick = damage_calc_top_move(&state, SidePerspective::Side2);
+        assert_eq!(
+            dmg_pick,
+            Some(Choices::HYDROPUMP),
+            "expected HYDROPUMP as opp top damage; got {:?}",
+            dmg_pick
+        );
+
+        // The HeuristicPrior probs vector should have non-uniform mass
+        // concentrated on the OHKO move's slot.
+        let max_prob = h.probs.iter().cloned().fold(0.0_f32, f32::max);
+        let uniform = 1.0 / h.probs.len() as f32;
+        assert!(
+            max_prob > uniform * 1.5,
+            "heuristic should concentrate mass on top move (max={}, uniform={})",
+            max_prob,
+            uniform
+        );
+    }
+}
