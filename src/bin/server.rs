@@ -66,6 +66,17 @@ pub struct Cli {
     #[arg(long, env = "POKE_ENGINE_FORCED_C", default_value_t = 0.0)]
     pub forced_playouts_c: f32,
 
+    /// Plan I Side2 extension: heuristic prior mix for opponent. 0.0 = uniform
+    /// (Plan I behavior); 0.5 = balanced. Side2 has no NN so uniform is the
+    /// blend baseline. Mirrors `--heuristic-prior-mix` (Side1).
+    #[arg(long, env = "POKE_ENGINE_HEURISTIC_MIX_SIDE2", default_value_t = 0.0)]
+    pub heuristic_prior_mix_side2: f32,
+
+    /// Plan I Side2 extension: forced-playouts c-constant for opponent. 0.0
+    /// = no-op. Mirrors `--forced-playouts-c` (Side1).
+    #[arg(long, env = "POKE_ENGINE_FORCED_C_SIDE2", default_value_t = 0.0)]
+    pub forced_playouts_c_side2: f32,
+
     /// Plan I: heuristic prior mass on damage-calc top move slot.
     #[arg(long, default_value_t = 0.6)]
     pub heuristic_prior_mass_dmg: f32,
@@ -87,6 +98,8 @@ pub struct AppState {
     pub heuristic_prior_mix: f32,
     /// Plan I: KataGo Forced Playouts constant. 0.0 → disabled.
     pub forced_playouts_c: f32,
+    pub heuristic_prior_mix_side2: f32,
+    pub forced_playouts_c_side2: f32,
     /// Plan I: heuristic prior mass on damage-calc top move slot.
     pub heuristic_prior_mass_dmg: f32,
     /// Plan I: heuristic prior mass on matchup-switch slot.
@@ -1110,6 +1123,8 @@ async fn main() {
         c_puct: cli.c_puct,
         heuristic_prior_mix: cli.heuristic_prior_mix,
         forced_playouts_c: cli.forced_playouts_c,
+        heuristic_prior_mix_side2: cli.heuristic_prior_mix_side2,
+        forced_playouts_c_side2: cli.forced_playouts_c_side2,
         heuristic_prior_mass_dmg: cli.heuristic_prior_mass_dmg,
         heuristic_prior_mass_switch: cli.heuristic_prior_mass_switch,
     };
