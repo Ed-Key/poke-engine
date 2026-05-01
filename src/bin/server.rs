@@ -298,6 +298,10 @@ async fn analyze_handler(
         let mut telemetry_raw_nn_probs: Vec<f32> = Vec::new();
         let mut telemetry_heuristic: Option<poke_engine::heuristic_prior::HeuristicPrior> = None;
         let mut telemetry_s1_priors_blended: Vec<f32> = Vec::new();
+        // Plan I Side2 (T6): mirror Side1 telemetry locals on opp side. Stay
+        // empty / None on the default-off path (--heuristic-prior-mix-side2=0).
+        let mut telemetry_s2_priors_blended: Vec<f32> = Vec::new();
+        let mut telemetry_heuristic_s2: Option<poke_engine::heuristic_prior::HeuristicPrior> = None;
         let mut search = if use_blended {
             // SAFETY of unwrap: `uses_nn()` guarantees the EvalKind::Nn arm.
             let client = match &eval_kind {
@@ -361,6 +365,9 @@ async fn analyze_handler(
                     heuristic_prior_mass_dmg,
                     heuristic_prior_mass_switch,
                 );
+                // Plan I Side2 (T6): capture opp heuristic for telemetry
+                // before it's consumed by the blender below.
+                telemetry_heuristic_s2 = heuristic_s2.clone();
                 // Build uniform NN-stand-in: 1/ACTION_DIM in every slot. As
                 // mix → 1.0 the blend is pure heuristic; as mix → 0.0 it is
                 // pure uniform (matches pre-fix behavior).
@@ -376,6 +383,8 @@ async fn analyze_handler(
                     heuristic_s2.as_ref(),
                     heuristic_prior_mix_side2,
                 );
+                // Plan I Side2 (T6): capture blended opp priors for telemetry.
+                telemetry_s2_priors_blended = blended.clone();
                 Some(blended)
             } else {
                 None
@@ -419,6 +428,9 @@ async fn analyze_handler(
             forced_playouts_triggered: search.forced_playouts_triggered,
             state: Some(&state_for_telemetry),
             s1_options: &s1_options_for_telemetry,
+            s2_priors_blended: &telemetry_s2_priors_blended,
+            heuristic_s2: telemetry_heuristic_s2.as_ref(),
+            forced_playouts_triggered_s2: search.forced_playouts_triggered_side2(),
         };
         emit_engine_instrument(
             &pre_search_breakdown,
@@ -600,6 +612,13 @@ pub struct InstrumentTelemetry<'a> {
     /// The s1 options at root, in the same order as `s1_move_names`. Used
     /// alongside `state` to call `map_policy_to_options`.
     pub s1_options: &'a [poke_engine::engine::state::MoveChoice],
+    /// Plan I Side2 extension: opp-side priors after heuristic+uniform blend.
+    /// Empty when --heuristic-prior-mix-side2 == 0.0.
+    pub s2_priors_blended: &'a [f32],
+    /// Plan I Side2 extension: opp-side heuristic before blending.
+    pub heuristic_s2: Option<&'a poke_engine::heuristic_prior::HeuristicPrior>,
+    /// Plan I Side2 extension: count of forced visits triggered on opp side.
+    pub forced_playouts_triggered_s2: u32,
 }
 
 impl<'a> InstrumentTelemetry<'a> {
@@ -615,6 +634,9 @@ impl<'a> InstrumentTelemetry<'a> {
             forced_playouts_triggered,
             state: None,
             s1_options: &[],
+            s2_priors_blended: &[],
+            heuristic_s2: None,
+            forced_playouts_triggered_s2: 0,
         }
     }
 }
@@ -770,6 +792,14 @@ fn emit_engine_instrument(
     let heuristic_pick_switch: Option<String> = telemetry
         .heuristic
         .and_then(|h| h.matchup_switch_pick.as_ref().map(|p| format!("{:?}", p)));
+    // Plan I Side2 (T6): mirror heuristic pick names on opp side. None when
+    // --heuristic-prior-mix-side2 == 0.0 (default), serializes as null.
+    let s2_heuristic_pick_dmg: Option<String> = telemetry
+        .heuristic_s2
+        .and_then(|h| h.damage_calc_pick.as_ref().map(|c| format!("{:?}", c)));
+    let s2_heuristic_pick_switch: Option<String> = telemetry
+        .heuristic_s2
+        .and_then(|h| h.matchup_switch_pick.as_ref().map(|p| format!("{:?}", p)));
 
     let payload = serde_json::json!({
         "label": label,
@@ -799,6 +829,12 @@ fn emit_engine_instrument(
         "heuristic_pick_dmg": heuristic_pick_dmg,
         "heuristic_pick_switch": heuristic_pick_switch,
         "prior_blend_per_top5": prior_blend_per_top5,
+        // Plan I Side2 (T6): symmetric Side2 fields. Empty / null on the
+        // default-off path (--heuristic-prior-mix-side2 == 0.0).
+        "s2_priors_blended": telemetry.s2_priors_blended,
+        "s2_heuristic_pick_dmg": s2_heuristic_pick_dmg,
+        "s2_heuristic_pick_switch": s2_heuristic_pick_switch,
+        "forced_playouts_triggered_s2": telemetry.forced_playouts_triggered_s2,
     });
 
     // serde_json::to_string is infallible for json! values built from primitives.
@@ -1010,6 +1046,10 @@ async fn analyze_stream_handler(
         let mut telemetry_raw_nn_probs: Vec<f32> = Vec::new();
         let mut telemetry_heuristic: Option<poke_engine::heuristic_prior::HeuristicPrior> = None;
         let mut telemetry_s1_priors_blended: Vec<f32> = Vec::new();
+        // Plan I Side2 (T6): mirror Side1 telemetry locals on opp side. Stay
+        // empty / None on the default-off path (--heuristic-prior-mix-side2=0).
+        let mut telemetry_s2_priors_blended: Vec<f32> = Vec::new();
+        let mut telemetry_heuristic_s2: Option<poke_engine::heuristic_prior::HeuristicPrior> = None;
         // MctsSearch owns the State. Cloning is cheap relative to a
         // multi-second MCTS run.
         let mut search = if use_blended {
@@ -1073,6 +1113,9 @@ async fn analyze_stream_handler(
                     heuristic_prior_mass_dmg,
                     heuristic_prior_mass_switch,
                 );
+                // Plan I Side2 (T6): capture opp heuristic for telemetry
+                // before it's consumed by the blender below.
+                telemetry_heuristic_s2 = heuristic_s2.clone();
                 // Build uniform NN-stand-in: 1/ACTION_DIM in every slot. As
                 // mix → 1.0 the blend is pure heuristic; as mix → 0.0 it is
                 // pure uniform (matches pre-fix behavior).
@@ -1088,6 +1131,8 @@ async fn analyze_stream_handler(
                     heuristic_s2.as_ref(),
                     heuristic_prior_mix_side2,
                 );
+                // Plan I Side2 (T6): capture blended opp priors for telemetry.
+                telemetry_s2_priors_blended = blended.clone();
                 Some(blended)
             } else {
                 None
@@ -1153,6 +1198,9 @@ async fn analyze_stream_handler(
             forced_playouts_triggered: search.forced_playouts_triggered,
             state: Some(&state_for_telemetry),
             s1_options: &s1_options_for_telemetry,
+            s2_priors_blended: &telemetry_s2_priors_blended,
+            heuristic_s2: telemetry_heuristic_s2.as_ref(),
+            forced_playouts_triggered_s2: search.forced_playouts_triggered_side2(),
         };
         emit_engine_instrument(
             &pre_search_breakdown,
