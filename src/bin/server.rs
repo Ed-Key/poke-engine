@@ -844,6 +844,12 @@ async fn analyze_stream_handler(
     let forced_playouts_c = app.forced_playouts_c;
     let heuristic_prior_mass_dmg = app.heuristic_prior_mass_dmg;
     let heuristic_prior_mass_switch = app.heuristic_prior_mass_switch;
+    // Plan I Side2 (Bug #3 fix): mirror analyze_handler — symmetric heuristic
+    // prior on the opponent perspective. Default 0.0 keeps pre-fix behavior
+    // bit-identical. `_forced_playouts_c_side2` is captured for T5; T4 only
+    // wires the prior.
+    let heuristic_prior_mix_side2 = app.heuristic_prior_mix_side2;
+    let _forced_playouts_c_side2 = app.forced_playouts_c_side2;
 
     // Channel between the blocking search thread and the async streaming
     // response body. Buffer 32 is enough for ~30s of updates at 1 Hz.
@@ -993,7 +999,9 @@ async fn analyze_stream_handler(
         // Plan I (Task 8b): when blending is requested AND we're in NN mode,
         // fetch the raw NN policy ourselves, blend with the heuristic prior,
         // and pass through `new_with_priors`. Otherwise fall through to the
-        // original `new_with_eval` path. Mirrors analyze_handler exactly.
+        // original `new_with_eval` path. Mirrors analyze_handler — both
+        // compute Side1 (NN-blended) and Side2 (uniform-blended when
+        // --heuristic-prior-mix-side2 > 0.0) priors.
         let use_blended = heuristic_prior_mix > 0.0 && eval_kind.uses_nn();
         let mut telemetry_raw_nn_probs: Vec<f32> = Vec::new();
         let mut telemetry_heuristic: Option<poke_engine::heuristic_prior::HeuristicPrior> = None;
@@ -1042,15 +1050,57 @@ async fn analyze_stream_handler(
                 }
             };
             telemetry_heuristic = heuristic;
+            // Plan I Side2 (Bug #3 fix): mirror the heuristic blend on opp side.
+            // Side2 has no NN policy — blend heuristic with uniform baseline so
+            // the opp model's prior reflects "what move would damage me / what
+            // switch would survive" instead of pure uniform. Default mix=0.0
+            // preserves pre-fix behavior (priors stay None).
+            //
+            // Scope limit: this only activates inside the `use_blended` arm
+            // (i.e. heuristic_prior_mix > 0.0 AND eval_kind.uses_nn()). If the
+            // operator passes --heuristic-prior-mix-side2 > 0.0 without also
+            // setting --heuristic-prior-mix > 0.0 in NN mode, Side2 prior will
+            // not activate.
+            let s2_priors_blended = if heuristic_prior_mix_side2 > 0.0 {
+                let heuristic_s2 = poke_engine::heuristic_prior::compute(
+                    &state,
+                    poke_engine::nn_state_encoder::SidePerspective::Side2,
+                    &s2_options,
+                    heuristic_prior_mass_dmg,
+                    heuristic_prior_mass_switch,
+                );
+                // Build uniform NN-stand-in: 1/ACTION_DIM in every slot. As
+                // mix → 1.0 the blend is pure heuristic; as mix → 0.0 it is
+                // pure uniform (matches pre-fix behavior).
+                let uniform_probs = vec![
+                    1.0_f32 / poke_engine::nn_client::ACTION_DIM as f32;
+                    poke_engine::nn_client::ACTION_DIM
+                ];
+                let blended = poke_engine::nn_state_encoder::map_policy_to_options_blended(
+                    &uniform_probs,
+                    &state,
+                    poke_engine::nn_state_encoder::SidePerspective::Side2,
+                    &s2_options,
+                    heuristic_s2.as_ref(),
+                    heuristic_prior_mix_side2,
+                );
+                Some(blended)
+            } else {
+                None
+            };
             MctsSearch::new_with_priors(
                 state.clone(),
                 s1_options,
                 s2_options,
                 c_puct,
                 s1_priors_blended,
-                None,
+                s2_priors_blended,
             )
         } else {
+            // NOTE: when `use_blended == false` (default flags or non-NN eval),
+            // we take the original Plan-pre-I path. `heuristic_prior_mix_side2`
+            // is intentionally NOT consulted here — the opp prior remains
+            // whatever `new_with_eval` constructs.
             MctsSearch::new_with_eval(
                 state.clone(),
                 s1_options,
