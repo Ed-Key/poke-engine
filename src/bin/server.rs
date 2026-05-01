@@ -248,9 +248,10 @@ async fn analyze_handler(
     let heuristic_prior_mass_switch = app.heuristic_prior_mass_switch;
     // Plan I Side2 (Bug #3 fix): symmetric heuristic prior on the opponent
     // perspective. Default 0.0 keeps pre-fix behavior bit-identical.
-    // `_forced_playouts_c_side2` is captured here for T5; T3 only wires the prior.
+    // `forced_playouts_c_side2` (T5) wires the per-side forced-playouts
+    // c-constant on the opp dimension via `set_c_forced_side2`.
     let heuristic_prior_mix_side2 = app.heuristic_prior_mix_side2;
-    let _forced_playouts_c_side2 = app.forced_playouts_c_side2;
+    let forced_playouts_c_side2 = app.forced_playouts_c_side2;
 
     // Translate to poke-engine State — catch panics from deserialization.
     // NN client calls happen inside this spawn_blocking thread, NEVER from
@@ -402,6 +403,9 @@ async fn analyze_handler(
         };
         // Plan I: forced-playouts root constant. 0.0 (default) is a no-op.
         search.set_c_forced(forced_playouts_c);
+        // Plan I Side2 (Bug #3 fix): per-side forced-playouts c-constant on
+        // the opp dimension. 0.0 (default) preserves Side1-only behavior.
+        search.set_c_forced_side2(forced_playouts_c_side2);
         search.run_for(Duration::from_millis(time_limit_ms));
         let mcts_result = search.snapshot(start.elapsed().as_millis() as u64);
         let elapsed_ms = start.elapsed().as_millis() as u64;
@@ -846,10 +850,10 @@ async fn analyze_stream_handler(
     let heuristic_prior_mass_switch = app.heuristic_prior_mass_switch;
     // Plan I Side2 (Bug #3 fix): mirror analyze_handler — symmetric heuristic
     // prior on the opponent perspective. Default 0.0 keeps pre-fix behavior
-    // bit-identical. `_forced_playouts_c_side2` is captured for T5; T4 only
-    // wires the prior.
+    // bit-identical. T5 wires the per-side forced-playouts c-constant via
+    // `set_c_forced_side2`.
     let heuristic_prior_mix_side2 = app.heuristic_prior_mix_side2;
-    let _forced_playouts_c_side2 = app.forced_playouts_c_side2;
+    let forced_playouts_c_side2 = app.forced_playouts_c_side2;
 
     // Channel between the blocking search thread and the async streaming
     // response body. Buffer 32 is enough for ~30s of updates at 1 Hz.
@@ -1111,6 +1115,9 @@ async fn analyze_stream_handler(
         };
         // Plan I: forced-playouts root constant. 0.0 (default) is a no-op.
         search.set_c_forced(forced_playouts_c);
+        // Plan I Side2 (Bug #3 fix): per-side forced-playouts c-constant on
+        // the opp dimension. 0.0 (default) preserves Side1-only behavior.
+        search.set_c_forced_side2(forced_playouts_c_side2);
         let start = Instant::now();
         let time_limit = Duration::from_millis(time_limit_ms);
         let interval = Duration::from_millis(update_interval_ms);

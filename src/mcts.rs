@@ -133,8 +133,10 @@ impl Node {
         &mut self,
         state: &mut State,
         c_puct: f32,
-        c_forced: f32,
+        c_forced_side1: f32,
+        c_forced_side2: f32,
         forced_counter: &mut u32,
+        forced_counter_side2: &mut u32,
     ) -> (*mut Node, usize, usize) {
         let return_node = self as *mut Node;
         if self.s1_options.is_none() {
@@ -150,19 +152,25 @@ impl Node {
             let (s1_idx, s1_forced) = self.maximize_with_forced_playouts(
                 self.s1_options.as_ref().unwrap(),
                 c_puct,
-                c_forced,
+                c_forced_side1,
             );
             let (s2_idx, s2_forced) = self.maximize_with_forced_playouts(
                 self.s2_options.as_ref().unwrap(),
                 c_puct,
-                c_forced,
+                c_forced_side2,
             );
-            // Plan I telemetry: increment once if the root iteration was
-            // overridden by forced-playouts on EITHER side. Counts at most
-            // one fire per iteration (matches the spec's per-iteration
-            // semantics, not per-side).
+            // Plan I telemetry: combined counter increments once if the root
+            // iteration was overridden by forced-playouts on EITHER side.
+            // Counts at most one fire per iteration (preserves the original
+            // per-iteration semantics).
             if s1_forced || s2_forced {
                 *forced_counter = forced_counter.saturating_add(1);
+            }
+            // Plan I Side2 telemetry: per-side counter — fires only when the
+            // Side2 dimension's forced-playouts branch overrode PUCT-max on
+            // this iteration. Independent of `forced_counter`.
+            if s2_forced {
+                *forced_counter_side2 = forced_counter_side2.saturating_add(1);
             }
             (s1_idx, s2_idx)
         } else {
@@ -177,7 +185,14 @@ impl Node {
                 let child_vec_ptr = child_vector as *mut Vec<Node>;
                 let chosen_child = self.sample_node(child_vec_ptr);
                 state.apply_instructions(&(*chosen_child).instructions.instruction_list);
-                (*chosen_child).selection(state, c_puct, c_forced, forced_counter)
+                (*chosen_child).selection(
+                    state,
+                    c_puct,
+                    c_forced_side1,
+                    c_forced_side2,
+                    forced_counter,
+                    forced_counter_side2,
+                )
             }
             None => (return_node, s1_mc_index, s2_mc_index),
         }
@@ -357,11 +372,21 @@ fn do_mcts(
     state: &mut State,
     root_eval: &f32,
     c_puct: f32,
-    c_forced: f32,
+    c_forced_side1: f32,
+    c_forced_side2: f32,
     forced_counter: &mut u32,
+    forced_counter_side2: &mut u32,
 ) {
-    let (mut new_node, s1_move, s2_move) =
-        unsafe { root_node.selection(state, c_puct, c_forced, forced_counter) };
+    let (mut new_node, s1_move, s2_move) = unsafe {
+        root_node.selection(
+            state,
+            c_puct,
+            c_forced_side1,
+            c_forced_side2,
+            forced_counter,
+            forced_counter_side2,
+        )
+    };
     new_node = unsafe { (*new_node).expand(state, s1_move, s2_move) };
     let rollout_result = unsafe { (*new_node).rollout(state, root_eval) };
     unsafe { (*new_node).backpropagate(rollout_result, state) }
@@ -470,10 +495,19 @@ pub struct MctsSearch {
     /// KataGo's published default. Used at root selection only —
     /// in-tree selection (depth >= 1) ignores this.
     pub c_forced: f32,
+    /// Plan I Side2 (Bug #3 fix): per-side forced-playouts c-constant for the
+    /// opponent dimension. 0.0 = no-op (preserves Plan I Side1-only behavior).
+    /// Independent from `c_forced` so the two sides can be A/B'd separately.
+    pub c_forced_side2: f32,
     /// Plan I telemetry: count of root selection iterations where Forced
     /// Playouts overrode PUCT-max on either side. With `c_forced == 0.0`
     /// this stays at 0 forever (force-visit never fires).
     pub forced_playouts_triggered: u32,
+    /// Plan I Side2 telemetry: count of root selection iterations where the
+    /// Side2 forced-playouts branch fired. Independent of
+    /// `forced_playouts_triggered` (which fires on either side). Stays at 0
+    /// when `c_forced_side2 == 0.0`.
+    pub forced_playouts_triggered_side2: u32,
 }
 
 impl MctsSearch {
@@ -574,7 +608,11 @@ impl MctsSearch {
             // Plan I: forced-playouts disabled by default. Existing tests
             // and CLI behavior are bit-identical until set_c_forced is called.
             c_forced: 0.0,
+            // Plan I Side2 (Bug #3 fix): opp-side forced-playouts disabled by
+            // default. set_c_forced_side2 enables it independently.
+            c_forced_side2: 0.0,
             forced_playouts_triggered: 0,
+            forced_playouts_triggered_side2: 0,
         }
     }
 
@@ -583,6 +621,18 @@ impl MctsSearch {
     /// the ROOT — in-tree selection ignores this value.
     pub fn set_c_forced(&mut self, c: f32) {
         self.c_forced = c.max(0.0);
+    }
+
+    /// Plan I Side2 (Bug #3 fix): set the per-side forced-playouts constant
+    /// for the opponent dimension. Clamped to >= 0. 0.0 disables (no-op,
+    /// preserves Plan I Side1-only behavior). Only consulted at the ROOT.
+    pub fn set_c_forced_side2(&mut self, c: f32) {
+        self.c_forced_side2 = c.max(0.0);
+    }
+
+    /// Plan I Side2 telemetry accessor.
+    pub fn forced_playouts_triggered_side2(&self) -> u32 {
+        self.forced_playouts_triggered_side2
     }
 
     /// Run MCTS for up to `budget` of wall-clock time. Returns the number of
@@ -602,7 +652,9 @@ impl MctsSearch {
                     &self.root_eval,
                     self.c_puct,
                     self.c_forced,
+                    self.c_forced_side2,
                     &mut self.forced_playouts_triggered,
+                    &mut self.forced_playouts_triggered_side2,
                 );
             }
 
@@ -1357,5 +1409,21 @@ mod stream_tests {
             "Engine must not pick Earthquake against Flying target. Got {}",
             best_name
         );
+    }
+
+    /// Plan I Side2 (Bug #3 fix): per-side `c_forced` API.
+    ///
+    /// `set_c_forced` controls Side1 (existing behavior, unchanged).
+    /// `set_c_forced_side2` controls Side2 (new). The two values are stored
+    /// independently so opp-side forced playouts can be tuned separately.
+    #[test]
+    fn test_set_c_forced_per_side() {
+        let state = State::default();
+        let (s1_options, s2_options) = state.root_get_all_options();
+        let mut search = MctsSearch::new(state, s1_options, s2_options);
+        search.set_c_forced(1.5);
+        search.set_c_forced_side2(2.5);
+        assert_eq!(search.c_forced, 1.5);
+        assert_eq!(search.c_forced_side2, 2.5);
     }
 }
