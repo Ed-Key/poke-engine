@@ -232,10 +232,22 @@ async fn analyze_handler(
     body: String,
 ) -> Result<Json<AnalyzeResponse>, (StatusCode, Json<ErrorResponse>)> {
     // Extract timeLimit if present in the JSON
-    let time_limit_ms = serde_json::from_str::<serde_json::Value>(&body)
-        .ok()
+    let parsed_top = serde_json::from_str::<serde_json::Value>(&body).ok();
+    let time_limit_ms = parsed_top
+        .as_ref()
         .and_then(|v| v.get("timeLimit")?.as_u64())
         .unwrap_or(DEFAULT_TIME_LIMIT_MS);
+    // Engine-log correlation keys forwarded by the proxy (apply_belief).
+    // Both are optional — direct-to-engine callers (e.g. Cobblemon mod)
+    // omit them and the [ENGINE-INSTRUMENT] payload renders `null`.
+    let battle_id: Option<String> = parsed_top
+        .as_ref()
+        .and_then(|v| v.get("battleId").and_then(|x| x.as_str()))
+        .map(String::from);
+    let turn: Option<u32> = parsed_top
+        .as_ref()
+        .and_then(|v| v.get("turn").and_then(|x| x.as_u64()))
+        .map(|u| u as u32);
 
     let raw_json = body;
     let eval_kind = app.eval_kind.clone();
@@ -431,6 +443,8 @@ async fn analyze_handler(
             s2_priors_blended: &telemetry_s2_priors_blended,
             heuristic_s2: telemetry_heuristic_s2.as_ref(),
             forced_playouts_triggered_s2: search.forced_playouts_triggered_side2(),
+            battle_id: battle_id.as_deref(),
+            turn,
         };
         emit_engine_instrument(
             &pre_search_breakdown,
@@ -619,6 +633,13 @@ pub struct InstrumentTelemetry<'a> {
     pub heuristic_s2: Option<&'a poke_engine::heuristic_prior::HeuristicPrior>,
     /// Plan I Side2 extension: count of forced visits triggered on opp side.
     pub forced_playouts_triggered_s2: u32,
+    /// Correlation key: Showdown battle room id (e.g. "battle-gen9ou-2256378900").
+    /// `None` when the request didn't go through the proxy belief overlay
+    /// (legacy direct-to-engine callers, default-off path).
+    pub battle_id: Option<&'a str>,
+    /// Correlation key: Showdown turn number at the time of this request.
+    /// Same default-off semantics as `battle_id`.
+    pub turn: Option<u32>,
 }
 
 impl<'a> InstrumentTelemetry<'a> {
@@ -637,6 +658,11 @@ impl<'a> InstrumentTelemetry<'a> {
             s2_priors_blended: &[],
             heuristic_s2: None,
             forced_playouts_triggered_s2: 0,
+            // Correlation keys default to None on this constructor — the
+            // signature stays backward-compat (callers pass `forced` only)
+            // and the engine-instrument payload renders `null` for both.
+            battle_id: None,
+            turn: None,
         }
     }
 }
@@ -802,6 +828,11 @@ fn emit_engine_instrument(
         .and_then(|h| h.matchup_switch_pick.as_ref().map(|p| format!("{:?}", p)));
 
     let payload = serde_json::json!({
+        // Correlation keys (engine-log → postmortem join). Render `null`
+        // when the request didn't come through the proxy belief overlay
+        // (legacy direct-to-engine callers, PIMC default-off path).
+        "battle_id": telemetry.battle_id,
+        "turn": telemetry.turn,
         "label": label,
         "sims": mcts_result.iteration_count,
         "my_top5": my_top5,
@@ -873,6 +904,17 @@ async fn analyze_stream_handler(
         .as_ref()
         .and_then(|v| v.get("updateIntervalMs")?.as_u64())
         .unwrap_or(DEFAULT_UPDATE_INTERVAL_MS);
+    // Engine-log correlation keys forwarded by the proxy (apply_belief).
+    // Both are optional — direct-to-engine callers omit them and the
+    // [ENGINE-INSTRUMENT] payload renders `null`.
+    let battle_id: Option<String> = parsed
+        .as_ref()
+        .and_then(|v| v.get("battleId").and_then(|x| x.as_str()))
+        .map(String::from);
+    let turn: Option<u32> = parsed
+        .as_ref()
+        .and_then(|v| v.get("turn").and_then(|x| x.as_u64()))
+        .map(|u| u as u32);
 
     let raw_json = body;
     let eval_kind = app.eval_kind.clone();
@@ -984,13 +1026,18 @@ async fn analyze_stream_handler(
             // is from the FIRST hypothesis (same player-side state across K).
             // PIMC path doesn't (yet) participate in Plan I blending — pass
             // empty telemetry so the new fields are present-but-neutral.
+            // Override the correlation keys so the PIMC log line still joins
+            // back to the postmortem on (battle_id, turn).
+            let mut pimc_telemetry = InstrumentTelemetry::empty(0);
+            pimc_telemetry.battle_id = battle_id.as_deref();
+            pimc_telemetry.turn = turn;
             emit_engine_instrument(
                 &pimc_breakdown,
                 &aggregated,
                 &s1_names,
                 &s2_names,
                 "pimc",
-                &InstrumentTelemetry::empty(0),
+                &pimc_telemetry,
             );
             let final_update = build_stream_update("final", &aggregated, &s1_names);
             let _ = emit(&tx, &final_update);
@@ -1201,6 +1248,8 @@ async fn analyze_stream_handler(
             s2_priors_blended: &telemetry_s2_priors_blended,
             heuristic_s2: telemetry_heuristic_s2.as_ref(),
             forced_playouts_triggered_s2: search.forced_playouts_triggered_side2(),
+            battle_id: battle_id.as_deref(),
+            turn,
         };
         emit_engine_instrument(
             &pre_search_breakdown,
