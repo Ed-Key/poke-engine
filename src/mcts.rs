@@ -13,8 +13,11 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 fn sigmoid(x: f32) -> f32 {
-    // Tuned so that ~200 points is very close to 1.0
-    1.0 / (1.0 + (-0.0125 * x).exp())
+    // Slope is tunable via `tuning::TuningConfig::eval_slope`. Default 0.0125
+    // matches pre-branch behavior (saturates at ~±200). Reduce to ~0.005 to
+    // give MCTS more dynamic range over the full evaluate() output.
+    let slope = crate::tuning::tuning().eval_slope;
+    1.0 / (1.0 + (-slope * x).exp())
 }
 
 #[derive(Debug)]
@@ -588,6 +591,20 @@ impl MctsSearch {
         s1_priors: Option<Vec<f32>>,
         s2_priors: Option<Vec<f32>>,
     ) -> Self {
+        // engine-prior-tuning: Dirichlet noise is mixed into the ROOT priors
+        // only (matching AlphaZero). When `dirichlet_eps == 0.0` (default),
+        // this is a no-op and behavior is bit-identical.
+        let cfg = crate::tuning::tuning();
+        let mut s1_priors = s1_priors;
+        let mut s2_priors = s2_priors;
+        if cfg.dirichlet_eps > 0.0 && cfg.dirichlet_alpha > 0.0 {
+            if let Some(ref mut p) = s1_priors {
+                crate::tuning::apply_dirichlet_noise(p, cfg.dirichlet_alpha, cfg.dirichlet_eps);
+            }
+            if let Some(ref mut p) = s2_priors {
+                crate::tuning::apply_dirichlet_noise(p, cfg.dirichlet_alpha, cfg.dirichlet_eps);
+            }
+        }
         let mut root = Box::new(Node::new());
         let s1p = s1_priors.as_deref();
         let s2p = s2_priors.as_deref();

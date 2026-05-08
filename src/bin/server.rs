@@ -84,6 +84,35 @@ pub struct Cli {
     /// Plan I: heuristic prior mass on matchup-switch slot.
     #[arg(long, default_value_t = 0.3)]
     pub heuristic_prior_mass_switch: f32,
+
+    /// engine-prior-tuning: cap each per-action NN prior at this value before
+    /// renormalize. `1.0` (default) is a no-op (bit-identical pre-branch).
+    /// `0.5` is a recommended starting point — clips runaway top-1 priors
+    /// (currently >=0.95 on ~42% of records) and redistributes the excess
+    /// mass uniformly across the rest of the action set.
+    #[arg(long, env = "POKE_ENGINE_PRIOR_CAP", default_value_t = 1.0)]
+    pub prior_cap: f32,
+
+    /// engine-prior-tuning: Dirichlet noise concentration α mixed into the
+    /// ROOT priors (matching AlphaZero). `0.0` (default) disables.
+    /// AlphaZero-chess uses `0.3`; for Pokemon's smaller action set try
+    /// `0.3`-`0.5`. Has no effect when `dirichlet_eps == 0.0`.
+    #[arg(long, env = "POKE_ENGINE_DIRICHLET_ALPHA", default_value_t = 0.0)]
+    pub dirichlet_alpha: f32,
+
+    /// engine-prior-tuning: fraction of Dirichlet noise blended with root
+    /// priors: `prior' = (1-eps)*prior + eps*dirichlet`. `0.0` (default)
+    /// disables. AlphaZero default `0.25`.
+    #[arg(long, env = "POKE_ENGINE_DIRICHLET_EPS", default_value_t = 0.0)]
+    pub dirichlet_eps: f32,
+
+    /// engine-prior-tuning: slope of the leaf-eval sigmoid. Default `0.0125`
+    /// matches pre-branch behavior (saturates at ~±200). Reduce to ~`0.005`
+    /// to give MCTS more dynamic range over evaluate()'s ~[-300, +300]
+    /// output. WARNING: changes the leaf-value scale; tests with hard-coded
+    /// expectations may need updating when this is non-default.
+    #[arg(long, env = "POKE_ENGINE_EVAL_SLOPE", default_value_t = 0.0125)]
+    pub eval_slope: f32,
 }
 
 /// Shared per-process state plumbed through axum handlers.
@@ -1288,6 +1317,19 @@ async fn main() {
         .try_init();
 
     let cli = Cli::parse();
+
+    // engine-prior-tuning: install runtime knobs before any search runs.
+    // Defaults match pre-branch behavior bit-identically.
+    poke_engine::tuning::init_tuning(poke_engine::tuning::TuningConfig {
+        prior_cap: cli.prior_cap,
+        dirichlet_alpha: cli.dirichlet_alpha,
+        dirichlet_eps: cli.dirichlet_eps,
+        eval_slope: cli.eval_slope,
+    });
+    log::info!(
+        "engine-prior-tuning: prior_cap={} dirichlet_alpha={} dirichlet_eps={} eval_slope={}",
+        cli.prior_cap, cli.dirichlet_alpha, cli.dirichlet_eps, cli.eval_slope,
+    );
 
     let eval_kind = if cli.nn_eval {
         let client = NnClient::new(

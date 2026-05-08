@@ -412,6 +412,12 @@ pub fn map_policy_to_options(
             *p = u;
         }
     }
+
+    // 5. engine-prior-tuning: cap any over-confident NN prior, then renormalize.
+    // Default cap is 1.0 (no-op, bit-identical pre-branch). Set < 1.0 via
+    // `--prior-cap` to redistribute mass when NN top-1 saturates.
+    crate::tuning::apply_prior_cap(&mut priors, crate::tuning::tuning().prior_cap);
+
     priors
 }
 

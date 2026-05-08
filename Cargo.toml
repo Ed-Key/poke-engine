@@ -25,6 +25,7 @@ debug = 1
 [dependencies]
 clap = { version = "4.5.4", features = ["derive", "env"] }
 rand = "0.9.1"
+rand_distr = "0.5"
 axum = "0.8"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
