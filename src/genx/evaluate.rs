@@ -22,7 +22,11 @@ const POKEMON_SPEED_BOOST: f32 = 25.0;
 
 pub const THREAT_SCORE_WEIGHT: f32 = 40.0;
 pub const MORTALITY_SCORE_WEIGHT: f32 = 20.0;
-pub const STATUS_THREAT_WEIGHT: f32 = 25.0;
+// engine-eval-revert: STATUS_THREAT zeroed 2026-05-08. Prior value 25.0
+// caused F-vs-Bug matchup to drop 80% → 40% win rate (Plan A regression,
+// 2026-04-25); was never reverted. Disabling to test whether removing it
+// improves PV match rate (currently ~21%). Restore by setting back to 25.0.
+pub const STATUS_THREAT_WEIGHT: f32 = 0.0;
 
 const POKEMON_BOOST_MULTIPLIER_6: f32 = 3.3;
 const POKEMON_BOOST_MULTIPLIER_5: f32 = 3.15;
