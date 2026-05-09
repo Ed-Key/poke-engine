@@ -20,7 +20,12 @@ const POKEMON_SPECIAL_ATTACK_BOOST: f32 = 25.0;
 const POKEMON_SPECIAL_DEFENSE_BOOST: f32 = 15.0;
 const POKEMON_SPEED_BOOST: f32 = 25.0;
 
-pub const THREAT_SCORE_WEIGHT: f32 = 40.0;
+// engine-eval-revert: THREAT_SCORE zeroed 2026-05-09. Prior value 40.0 was
+// the highest-weighted term in the eval. Foul Play upstream (NeurIPS 2025
+// winner) has no THREAT_SCORE term. Suspected to double-count with HP_term
+// + POKEMON_ALIVE + damage_calc rollouts → over-amplifies offensive lines.
+// To restore, set back to 40.0.
+pub const THREAT_SCORE_WEIGHT: f32 = 0.0;
 pub const MORTALITY_SCORE_WEIGHT: f32 = 20.0;
 // engine-eval-revert: STATUS_THREAT zeroed 2026-05-08. Prior value 25.0
 // caused F-vs-Bug matchup to drop 80% → 40% win rate (Plan A regression,
