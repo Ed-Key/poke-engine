@@ -1300,6 +1300,58 @@ mod stream_tests {
         );
     }
 
+    /// P4: pick_deterministic=true must always return the move with the most
+    /// aggregated weighted-visits across hypotheses (argmax), regardless of
+    /// invocation count or seed. Stable, defensible top-pick is the contract
+    /// the copilot relies on.
+    #[test]
+    fn test_aggregate_pimc_deterministic_argmax_is_stable() {
+        use crate::engine::state::MoveChoice;
+        use crate::state::PokemonMoveIndex;
+        let mk = |mc: MoveChoice, v: u32| MctsSideResult {
+            move_choice: mc,
+            total_score: 0.0,
+            visits: v,
+        };
+        // Two hypotheses; M0 dominates in both → argmax must always be M0.
+        // Even though M1 is within 75% threshold (would survive into the
+        // weighted-random pool), deterministic mode must pick M0 every time.
+        let r1 = MctsResult {
+            s1: vec![
+                mk(MoveChoice::Move(PokemonMoveIndex::M0), 100),
+                mk(MoveChoice::Move(PokemonMoveIndex::M1), 80),
+            ],
+            s2: vec![],
+            iteration_count: 180,
+            principal_variation: vec![],
+        };
+        let r2 = MctsResult {
+            s1: vec![
+                mk(MoveChoice::Move(PokemonMoveIndex::M0), 95),
+                mk(MoveChoice::Move(PokemonMoveIndex::M1), 78),
+            ],
+            s2: vec![],
+            iteration_count: 173,
+            principal_variation: vec![],
+        };
+        // Run 5 times — argmax MUST be M0 every single time.
+        for trial in 0..5 {
+            let agg = aggregate_pimc(vec![r1.clone(), r2.clone()], true, None);
+            assert!(
+                matches!(agg.s1[0].move_choice, MoveChoice::Move(PokemonMoveIndex::M0)),
+                "trial {}: deterministic argmax must always pick M0, got {:?}",
+                trial,
+                agg.s1[0].move_choice
+            );
+        }
+        // Seed should be ignored in deterministic mode (still always M0).
+        let agg_seeded = aggregate_pimc(vec![r1.clone(), r2.clone()], true, Some(7));
+        assert!(matches!(
+            agg_seeded.s1[0].move_choice,
+            MoveChoice::Move(PokemonMoveIndex::M0)
+        ));
+    }
+
     #[test]
     fn test_aggregate_pimc_weighted_random_with_seed_is_deterministic() {
         use crate::engine::state::MoveChoice;

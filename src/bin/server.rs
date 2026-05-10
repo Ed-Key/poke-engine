@@ -206,7 +206,7 @@ fn handles_spawn(
     _seed: u64,
     eval_kind: EvalKind,
     c_puct: f32,
-) -> std::thread::JoinHandle<Result<poke_engine::mcts::MctsResult, String>> {
+) -> std::thread::JoinHandle<Result<(poke_engine::mcts::MctsResult, Option<String>), String>> {
     use std::time::{Duration, Instant};
 
     std::thread::spawn(move || {
@@ -216,6 +216,26 @@ fn handles_spawn(
         if s1_options.is_empty() {
             return Err("No legal moves for side one".to_string());
         }
+
+        // P4: snapshot a short label of THIS hypothesis's sampled opp set
+        // BEFORE state moves into the search. The breakdown UX wants users to
+        // see which hypothesis (e.g. "Diancie @ Diancite / Magic Bounce") led
+        // to which top recommendation. We use side_two's active Pokemon
+        // because PIMC currently varies only opp identity, not player.
+        let opp_summary = {
+            let active = state.side_two.get_active_immutable();
+            // Display: "<Species> @ <Item> / <Ability>"
+            // Item/Ability serialize to lowercased internal identifiers; the
+            // copilot UI capitalizes for display. We keep the raw string here
+            // and let the consumer prettify.
+            Some(format!(
+                "{} @ {:?} / {:?}",
+                format!("{:?}", active.id),
+                active.item,
+                active.ability
+            ))
+        };
+
         let mut search = MctsSearch::new_with_eval(
             state.clone(),
             s1_options,
@@ -225,8 +245,32 @@ fn handles_spawn(
         );
         let start = Instant::now();
         search.run_for(Duration::from_millis(budget_ms));
-        Ok(search.snapshot(start.elapsed().as_millis() as u64))
+        Ok((
+            search.snapshot(start.elapsed().as_millis() as u64),
+            opp_summary,
+        ))
     })
+}
+
+// Per-hypothesis breakdown entry attached to PIMC `final` events.
+//
+// P4: lets the copilot UI render a vote bar showing which hypotheses agree
+// vs dissent, even when the deterministic argmax winner is the same as a
+// non-deterministic pick. Each entry corresponds to one of the K parallel
+// hypothesis searches.
+//
+// Field shape is the load-bearing contract for the extension/proxy UX:
+//   - top_move:    uppercase move string (matches StreamUpdate.bestMove case)
+//   - value:       average score of the top move (total_score / visits)
+//   - visit_share: top-move visits / total visits across all s1 options [0, 1]
+//   - opp_summary: short label of the sampled opp set (e.g. "Diancie @ Diancite / Magic Bounce")
+#[derive(Serialize, Debug, Clone)]
+struct HypothesisBreakdown {
+    top_move: String,
+    value: f32,
+    visit_share: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    opp_summary: Option<String>,
 }
 
 // Streaming NDJSON event emitted by /analyze/stream.
@@ -244,6 +288,11 @@ struct StreamUpdate {
     alternatives: Vec<Alternative>,
     #[serde(skip_serializing_if = "Option::is_none")]
     message: Option<String>,
+    /// P4: per-hypothesis breakdown attached only to PIMC `final` events.
+    /// `None` (and skipped from JSON) for single-search and non-final
+    /// streaming events, so non-PIMC consumers see no shape change.
+    #[serde(rename = "pimcBreakdown", skip_serializing_if = "Option::is_none")]
+    pimc_breakdown: Option<Vec<HypothesisBreakdown>>,
 }
 
 // -- Handlers --
@@ -333,6 +382,8 @@ async fn analyze_handler(
         let state_for_telemetry = state.clone();
         let s1_options_for_telemetry: Vec<poke_engine::engine::state::MoveChoice> =
             s1_options.clone();
+        let s2_options_for_telemetry: Vec<poke_engine::engine::state::MoveChoice> =
+            s2_options.clone();
 
         // Plan I: when blending is requested AND we're in NN mode, fetch the
         // raw NN policy ourselves, blend with the heuristic prior, and pass
@@ -482,6 +533,7 @@ async fn analyze_handler(
             forced_playouts_triggered: search.forced_playouts_triggered,
             state: Some(&state_for_telemetry),
             s1_options: &s1_options_for_telemetry,
+            s2_options: &s2_options_for_telemetry,
             s2_priors_blended: &telemetry_s2_priors_blended,
             heuristic_s2: telemetry_heuristic_s2.as_ref(),
             forced_playouts_triggered_s2: search.forced_playouts_triggered_side2(),
@@ -570,7 +622,15 @@ async fn analyze_handler(
 }
 
 // Build a StreamUpdate from a MctsResult snapshot + the list of s1 move
-// names (indexed to match mcts_result.s1).
+// names (indexed to match `s1_options`, NOT `mcts_result.s1`).
+//
+// `s1_options` is the same root-options vec used to seed the search, in the
+// canonical order returned by `root_get_all_options()`. `s1_move_names[i]`
+// is the human-readable name for `s1_options[i]`. We resolve each
+// `mcts_result.s1[i].move_choice` back to a name by lookup-by-MoveChoice
+// (NOT by index) — the PIMC aggregator reorders its s1 vec (winner first,
+// then by visits), so positional pairing produces wrong move labels and a
+// wrong `bestMove`. See branch `feat/pimc-p4-aggregator` for context.
 //
 // Mirrors the post-processing from analyze_handler (sort by visits desc,
 // split into best/alternatives, compute pv from principal_variation), but
@@ -578,16 +638,26 @@ async fn analyze_handler(
 fn build_stream_update(
     event: &'static str,
     mcts_result: &MctsResult,
+    s1_options: &[poke_engine::engine::state::MoveChoice],
     s1_move_names: &[String],
 ) -> StreamUpdate {
+    // Build MoveChoice -> name lookup so we resolve names off the
+    // move_choice payload itself, never off an index that may have been
+    // reordered upstream (e.g. by `aggregate_pimc`).
+    let name_for: std::collections::HashMap<poke_engine::engine::state::MoveChoice, String> =
+        s1_options
+            .iter()
+            .zip(s1_move_names.iter())
+            .map(|(mc, name)| (*mc, name.clone()))
+            .collect();
+
     // Pair each s1 result with its move name and avg-score
     let mut scored: Vec<(String, f32, u32)> = mcts_result
         .s1
         .iter()
-        .enumerate()
-        .map(|(i, r)| {
-            let name = s1_move_names
-                .get(i)
+        .map(|r| {
+            let name = name_for
+                .get(&r.move_choice)
                 .cloned()
                 .unwrap_or_else(|| format!("{:?}", r.move_choice));
             let avg = if r.visits > 0 {
@@ -644,6 +714,9 @@ fn build_stream_update(
         pv,
         alternatives,
         message: None,
+        // P4: callers attach pimcBreakdown after construction (only for PIMC
+        // final events). build_stream_update has no per-hypothesis context.
+        pimc_breakdown: None,
     }
 }
 
@@ -666,8 +739,15 @@ pub struct InstrumentTelemetry<'a> {
     /// `map_policy_to_options` for the prior_blend_per_top5 join.
     pub state: Option<&'a poke_engine::state::State>,
     /// The s1 options at root, in the same order as `s1_move_names`. Used
-    /// alongside `state` to call `map_policy_to_options`.
+    /// alongside `state` to call `map_policy_to_options`. Also used as the
+    /// authoritative `MoveChoice -> name` join key for log emission so that
+    /// callers passing a reordered `mcts_result.s1` (e.g. the PIMC
+    /// aggregator) still get correct move labels.
     pub s1_options: &'a [poke_engine::engine::state::MoveChoice],
+    /// The s2 options at root, in the same order as `s2_move_names`. Same
+    /// `MoveChoice -> name` join semantics as `s1_options`. Empty when not
+    /// available (back-compat for legacy callers).
+    pub s2_options: &'a [poke_engine::engine::state::MoveChoice],
     /// Plan I Side2 extension: opp-side priors after heuristic+uniform blend.
     /// Empty when --heuristic-prior-mix-side2 == 0.0.
     pub s2_priors_blended: &'a [f32],
@@ -697,6 +777,7 @@ impl<'a> InstrumentTelemetry<'a> {
             forced_playouts_triggered,
             state: None,
             s1_options: &[],
+            s2_options: &[],
             s2_priors_blended: &[],
             heuristic_s2: None,
             forced_playouts_triggered_s2: 0,
@@ -775,6 +856,41 @@ fn emit_engine_instrument(
         Vec::new()
     };
 
+    // Build `MoveChoice -> name` lookups for s1 and s2 so we resolve names
+    // off `move_choice` directly. Index-pairing is unsafe in the PIMC path
+    // because `aggregate_pimc` reorders the s1 vec (winner first, then by
+    // visits desc) so positional `mcts_result.s1[i]` no longer aligns with
+    // `s1_move_names[i]` (which is in `root_get_all_options()` order).
+    // For the single-search path, MctsSearch::snapshot preserves the input
+    // ordering so the lookup-by-MoveChoice is observationally identical to
+    // the previous index-based pairing — no behavioral change there.
+    let s1_name_for: std::collections::HashMap<poke_engine::engine::state::MoveChoice, String> =
+        telemetry
+            .s1_options
+            .iter()
+            .zip(s1_move_names.iter())
+            .map(|(mc, n)| (*mc, n.clone()))
+            .collect();
+    // Per-MoveChoice prior lookup (priors are in s1_options order; same join key).
+    let raw_nn_prior_for: std::collections::HashMap<
+        poke_engine::engine::state::MoveChoice,
+        f32,
+    > = telemetry
+        .s1_options
+        .iter()
+        .zip(raw_nn_priors_in_options_order.iter())
+        .map(|(mc, p)| (*mc, *p))
+        .collect();
+    let blended_prior_for: std::collections::HashMap<
+        poke_engine::engine::state::MoveChoice,
+        f32,
+    > = telemetry
+        .s1_options
+        .iter()
+        .zip(telemetry.s1_priors_blended.iter())
+        .map(|(mc, p)| (*mc, *p))
+        .collect();
+
     // Sort s1 by visits desc, take top 5.
     let mut s1_idx: Vec<usize> = (0..mcts_result.s1.len()).collect();
     s1_idx.sort_by(|a, b| mcts_result.s1[*b].visits.cmp(&mcts_result.s1[*a].visits));
@@ -783,8 +899,8 @@ fn emit_engine_instrument(
         .take(5)
         .map(|&i| {
             let r = &mcts_result.s1[i];
-            let name = s1_move_names
-                .get(i)
+            let name = s1_name_for
+                .get(&r.move_choice)
                 .cloned()
                 .unwrap_or_else(|| format!("{:?}", r.move_choice))
                 .to_uppercase();
@@ -801,12 +917,11 @@ fn emit_engine_instrument(
         })
         .collect();
 
-    // Plan I: per-top-5 raw NN prior + blended prior, joined by option index.
-    // Both `raw_nn_priors_in_options_order` and `telemetry.s1_priors_blended`
-    // are indexed in s1_options order, which is the same order s1_move_names
-    // (and mcts_result.s1) uses. So `i` from s1_idx is the join key directly.
-    let prior_blend_per_top5: Vec<serde_json::Value> = if raw_nn_priors_in_options_order.is_empty()
-        || telemetry.s1_priors_blended.is_empty()
+    // Plan I: per-top-5 raw NN prior + blended prior, joined by MoveChoice
+    // (was: by option index — that broke when mcts_result.s1 was reordered
+    // upstream, e.g. by aggregate_pimc).
+    let prior_blend_per_top5: Vec<serde_json::Value> = if raw_nn_prior_for.is_empty()
+        || blended_prior_for.is_empty()
     {
         Vec::new()
     } else {
@@ -815,13 +930,13 @@ fn emit_engine_instrument(
             .take(5)
             .map(|&i| {
                 let r = &mcts_result.s1[i];
-                let name = s1_move_names
-                    .get(i)
+                let name = s1_name_for
+                    .get(&r.move_choice)
                     .cloned()
                     .unwrap_or_else(|| format!("{:?}", r.move_choice))
                     .to_uppercase();
-                let prior_nn = raw_nn_priors_in_options_order.get(i).copied().unwrap_or(0.0);
-                let prior_blended = telemetry.s1_priors_blended.get(i).copied().unwrap_or(0.0);
+                let prior_nn = raw_nn_prior_for.get(&r.move_choice).copied().unwrap_or(0.0);
+                let prior_blended = blended_prior_for.get(&r.move_choice).copied().unwrap_or(0.0);
                 serde_json::json!({
                     "move": name,
                     "prior_nn": round4(prior_nn),
@@ -831,6 +946,16 @@ fn emit_engine_instrument(
             .collect()
     };
 
+    // s2: same lookup-by-MoveChoice pattern. Falls back to positional
+    // pairing only when telemetry.s2_options is empty (legacy callers that
+    // haven't yet plumbed it through).
+    let s2_name_for: std::collections::HashMap<poke_engine::engine::state::MoveChoice, String> =
+        telemetry
+            .s2_options
+            .iter()
+            .zip(s2_move_names.iter())
+            .map(|(mc, n)| (*mc, n.clone()))
+            .collect();
     let mut s2_idx: Vec<usize> = (0..mcts_result.s2.len()).collect();
     s2_idx.sort_by(|a, b| mcts_result.s2[*b].visits.cmp(&mcts_result.s2[*a].visits));
     let opp_top3: Vec<serde_json::Value> = s2_idx
@@ -838,11 +963,19 @@ fn emit_engine_instrument(
         .take(3)
         .map(|&i| {
             let r = &mcts_result.s2[i];
-            let name = s2_move_names
-                .get(i)
-                .cloned()
-                .unwrap_or_else(|| format!("{:?}", r.move_choice))
-                .to_uppercase();
+            let name = if !s2_name_for.is_empty() {
+                s2_name_for
+                    .get(&r.move_choice)
+                    .cloned()
+                    .unwrap_or_else(|| format!("{:?}", r.move_choice))
+                    .to_uppercase()
+            } else {
+                s2_move_names
+                    .get(i)
+                    .cloned()
+                    .unwrap_or_else(|| format!("{:?}", r.move_choice))
+                    .to_uppercase()
+            };
             let avg = if r.visits > 0 { r.total_score / r.visits as f32 } else { 0.0 };
             serde_json::json!({
                 "move": name,
@@ -925,6 +1058,7 @@ fn error_stream_update(msg: String) -> StreamUpdate {
         pv: Vec::new(),
         alternatives: Vec::new(),
         message: Some(msg),
+        pimc_breakdown: None,
     }
 }
 
@@ -1035,10 +1169,17 @@ async fn analyze_stream_handler(
                 handles.push(h);
             }
             // Join all. If any worker errored, abort PIMC and emit error.
+            // P4: workers now return (MctsResult, Option<String>) — second
+            // element is the per-hypothesis opp summary used for the
+            // copilot UI vote-bar.
             let mut results = Vec::with_capacity(k);
+            let mut hyp_summaries: Vec<Option<String>> = Vec::with_capacity(k);
             for h in handles {
                 match h.join() {
-                    Ok(Ok(r)) => results.push(r),
+                    Ok(Ok((r, summary))) => {
+                        results.push(r);
+                        hyp_summaries.push(summary);
+                    }
                     Ok(Err(msg)) => {
                         let _ = emit(&tx, &error_stream_update(format!("PIMC worker error: {}", msg)));
                         return;
@@ -1054,21 +1195,78 @@ async fn analyze_stream_handler(
                 return;
             }
 
+            // P4: build per-hypothesis breakdown BEFORE aggregate_pimc consumes
+            // the results vec. Each entry summarizes one of the K parallel
+            // searches: top move, its average score, and visit-share. The
+            // copilot extension renders these as a vote bar so the user can
+            // see which hypotheses agree vs dissent — load-bearing UX even
+            // when the deterministic argmax winner doesn't change.
+            //
+            // We need the FIRST hypothesis's parsed state for s1 move-name
+            // resolution (all K share the same player-side team), so parse
+            // it once here and reuse for both the breakdown and the
+            // aggregated final event below.
+            let parsed_first = poke_engine::translate::auto_detect_and_parse(&first_hyp_for_names);
+            let pimc_breakdown_entries: Vec<HypothesisBreakdown> = results
+                .iter()
+                .enumerate()
+                .map(|(i, r)| {
+                    let total_visits: u32 = r.s1.iter().map(|m| m.visits).sum();
+                    // Pick this hypothesis's own top-visited s1 move.
+                    let top = r.s1.iter().max_by_key(|m| m.visits);
+                    let (top_move, value, visit_share) = match top {
+                        Some(t) => {
+                            // Resolve move name via first hypothesis's side_one
+                            // (same player-side across K). Fall back to Debug
+                            // formatting if state parse failed earlier.
+                            let name = match &parsed_first {
+                                Ok(state) => t.move_choice.to_string(&state.side_one),
+                                Err(_) => format!("{:?}", t.move_choice),
+                            };
+                            let v = if t.visits > 0 { t.total_score / t.visits as f32 } else { 0.0 };
+                            let share = if total_visits > 0 {
+                                t.visits as f32 / total_visits as f32
+                            } else {
+                                0.0
+                            };
+                            (name.to_uppercase(), v, share)
+                        }
+                        None => (String::new(), 0.0, 0.0),
+                    };
+                    HypothesisBreakdown {
+                        top_move,
+                        value,
+                        visit_share,
+                        opp_summary: hyp_summaries.get(i).cloned().flatten(),
+                    }
+                })
+                .collect();
+
             // Aggregate.
-            let aggregated = poke_engine::mcts::aggregate_pimc(results, false, None);
+            // P4: pick_deterministic = true (was false). For the copilot use
+            // case we need a stable, defensible top recommendation per turn —
+            // the previous weighted-random sample over top-75% of vote shares
+            // was good for autonomous-bot exploration variance but bad for an
+            // advisory tool that the user is reading in real time. Weighted-
+            // random code path remains intact behind the bool flag for
+            // future autonomous-bot scenarios.
+            let aggregated = poke_engine::mcts::aggregate_pimc(results, true, None);
 
             // Synthesize the s1 move-name list from the FIRST hypothesis's state.
             // (All K hypotheses share the same player-side team — only opp varies.)
-            let (s1_names, s2_names, pimc_breakdown) =
-                match poke_engine::translate::auto_detect_and_parse(&first_hyp_for_names) {
+            // We also keep `s1_options` / `s2_options` so downstream emitters
+            // can resolve names by `MoveChoice` lookup (NOT by index — the
+            // PIMC aggregator reorders s1, so positional pairing is unsafe).
+            let (s1_options_pimc, s2_options_pimc, s1_names, s2_names, pimc_eval_breakdown) =
+                match &parsed_first {
                     Ok(state) => {
                         let (s1_options, s2_options) = state.root_get_all_options();
                         let s1n: Vec<String> = s1_options.iter().map(|mc| mc.to_string(&state.side_one)).collect();
                         let s2n: Vec<String> = s2_options.iter().map(|mc| mc.to_string(&state.side_two)).collect();
-                        let bd = evaluate_breakdown(&state);
-                        (s1n, s2n, bd)
+                        let bd = evaluate_breakdown(state);
+                        (s1_options, s2_options, s1n, s2n, bd)
                     }
-                    Err(_) => (Vec::new(), Vec::new(), EvalBreakdown::default()),
+                    Err(_) => (Vec::new(), Vec::new(), Vec::new(), Vec::new(), EvalBreakdown::default()),
                 };
             // [ENGINE-INSTRUMENT] for PIMC aggregated result. Eval breakdown
             // is from the FIRST hypothesis (same player-side state across K).
@@ -1079,15 +1277,23 @@ async fn analyze_stream_handler(
             let mut pimc_telemetry = InstrumentTelemetry::empty(0);
             pimc_telemetry.battle_id = battle_id.as_deref();
             pimc_telemetry.turn = turn;
+            // Telemetry path also needs s1_options + s2_options for name
+            // lookup (the emit_engine_instrument fix below resolves names by
+            // MoveChoice).
+            pimc_telemetry.s1_options = &s1_options_pimc;
+            pimc_telemetry.s2_options = &s2_options_pimc;
             emit_engine_instrument(
-                &pimc_breakdown,
+                &pimc_eval_breakdown,
                 &aggregated,
                 &s1_names,
                 &s2_names,
                 "pimc",
                 &pimc_telemetry,
             );
-            let final_update = build_stream_update("final", &aggregated, &s1_names);
+            let mut final_update = build_stream_update("final", &aggregated, &s1_options_pimc, &s1_names);
+            // P4: attach per-hypothesis breakdown to the PIMC final event only.
+            // Single-search path leaves this as None (skipped from JSON).
+            final_update.pimc_breakdown = Some(pimc_breakdown_entries);
             let _ = emit(&tx, &final_update);
             return;
         }
@@ -1130,6 +1336,8 @@ async fn analyze_stream_handler(
         let state_for_telemetry = state.clone();
         let s1_options_for_telemetry: Vec<poke_engine::engine::state::MoveChoice> =
             s1_options.clone();
+        let s2_options_for_telemetry: Vec<poke_engine::engine::state::MoveChoice> =
+            s2_options.clone();
 
         // Plan I (Task 8b): when blending is requested AND we're in NN mode,
         // fetch the raw NN policy ourselves, blend with the heuristic prior,
@@ -1278,7 +1486,7 @@ async fn analyze_stream_handler(
             search.run_for(slice);
 
             let snap = search.snapshot(start.elapsed().as_millis() as u64);
-            let update = build_stream_update("update", &snap, &s1_move_names);
+            let update = build_stream_update("update", &snap, &s1_options_for_telemetry, &s1_move_names);
             if !emit(&tx, &update) {
                 // Client disconnected. Abort the search.
                 return;
@@ -1298,6 +1506,7 @@ async fn analyze_stream_handler(
             forced_playouts_triggered: search.forced_playouts_triggered,
             state: Some(&state_for_telemetry),
             s1_options: &s1_options_for_telemetry,
+            s2_options: &s2_options_for_telemetry,
             s2_priors_blended: &telemetry_s2_priors_blended,
             heuristic_s2: telemetry_heuristic_s2.as_ref(),
             forced_playouts_triggered_s2: search.forced_playouts_triggered_side2(),
@@ -1312,7 +1521,7 @@ async fn analyze_stream_handler(
             "single",
             &telemetry,
         );
-        let final_update = build_stream_update("final", &snap, &s1_move_names);
+        let final_update = build_stream_update("final", &snap, &s1_options_for_telemetry, &s1_move_names);
         let _ = emit(&tx, &final_update);
     });
 
@@ -1447,5 +1656,169 @@ mod tests {
     fn test_extract_hypotheses_empty_array_returns_none() {
         let body = r#"{"hypotheses":[]}"#;
         assert!(extract_hypotheses(body).is_none());
+    }
+
+    // ---- P4 tests ----
+
+    /// PIMC `final` StreamUpdate with K=3 hypotheses must serialize to JSON
+    /// containing a `pimcBreakdown` array of length 3. Each entry must carry
+    /// the contractual field set (top_move, value, visit_share). This is the
+    /// load-bearing wire-format guarantee the copilot extension consumes.
+    #[test]
+    fn test_pimc_breakdown_json_shape() {
+        let entries = vec![
+            HypothesisBreakdown {
+                top_move: "SCALD".to_string(),
+                value: 0.65,
+                visit_share: 0.75,
+                opp_summary: Some("Diancie @ Diancite / Magic Bounce".to_string()),
+            },
+            HypothesisBreakdown {
+                top_move: "SCALD".to_string(),
+                value: 0.61,
+                visit_share: 0.71,
+                opp_summary: Some("Volcarona @ Heavy-Duty Boots / Flame Body".to_string()),
+            },
+            HypothesisBreakdown {
+                top_move: "RECOVER".to_string(),
+                value: 0.55,
+                visit_share: 0.62,
+                opp_summary: None,
+            },
+        ];
+        let su = StreamUpdate {
+            event: "final",
+            best_move: "SCALD".to_string(),
+            confidence: 0.62,
+            sims: 5_000_000,
+            depth: 4,
+            pv: vec!["you=SCALD them=PSYCHIC".to_string()],
+            alternatives: Vec::new(),
+            message: None,
+            pimc_breakdown: Some(entries),
+        };
+        let json = serde_json::to_string(&su).expect("serialize");
+        // Field is camelCased per the rename attribute.
+        assert!(
+            json.contains("\"pimcBreakdown\""),
+            "expected pimcBreakdown field in JSON, got: {}",
+            json
+        );
+        // Re-parse and validate array length + entry contract.
+        let v: serde_json::Value = serde_json::from_str(&json).expect("re-parse");
+        let arr = v
+            .get("pimcBreakdown")
+            .and_then(|x| x.as_array())
+            .expect("pimcBreakdown must be array");
+        assert_eq!(arr.len(), 3, "K=3 hypotheses → 3 breakdown entries");
+        for entry in arr {
+            assert!(entry.get("top_move").is_some(), "missing top_move");
+            assert!(entry.get("value").is_some(), "missing value");
+            assert!(entry.get("visit_share").is_some(), "missing visit_share");
+        }
+        // First entry concrete sanity.
+        assert_eq!(arr[0]["top_move"], "SCALD");
+        assert_eq!(arr[0]["opp_summary"], "Diancie @ Diancite / Magic Bounce");
+        // Third entry has no opp_summary → field omitted from JSON entirely
+        // (skip_serializing_if = "Option::is_none").
+        assert!(arr[2].get("opp_summary").is_none());
+    }
+
+    /// Regression: `build_stream_update` must resolve move names by
+    /// `MoveChoice` lookup, NOT by `mcts_result.s1[i]` index. The PIMC
+    /// aggregator reorders its s1 vec (winner first, then by visits desc),
+    /// so positional pairing against `s1_move_names` (which is in
+    /// `root_get_all_options()` order) produces the wrong `bestMove`. This
+    /// test pins the correct behavior: when all hypotheses agree on
+    /// MoveMega(M0) as the top move, the emitted bestMove must be
+    /// "diamondstorm-mega" (uppercased), NOT "diamondstorm".
+    ///
+    /// Reproduces the bug captured in
+    /// `analysis/engine-replay/battle-gen9nationaldex-2605820451.jsonl`
+    /// (turn 0): all 4 PIMC hypotheses voted MoveMega(M0); pre-fix
+    /// aggregator emitted bestMove=DIAMONDSTORM (wrong, base variant).
+    #[test]
+    fn test_build_stream_update_resolves_names_by_move_choice_not_index() {
+        use poke_engine::engine::state::MoveChoice;
+        use poke_engine::mcts::{MctsResult, MctsSideResult};
+        use poke_engine::state::PokemonMoveIndex;
+
+        // s1_options in canonical root_get_all_options() order:
+        //   [0] Move(M0)      = "diamondstorm"
+        //   [1] MoveMega(M0)  = "diamondstorm-mega"
+        //   [2] Move(M1)      = "earthpower"
+        let s1_options = vec![
+            MoveChoice::Move(PokemonMoveIndex::M0),
+            MoveChoice::MoveMega(PokemonMoveIndex::M0),
+            MoveChoice::Move(PokemonMoveIndex::M1),
+        ];
+        let s1_move_names = vec![
+            "diamondstorm".to_string(),
+            "diamondstorm-mega".to_string(),
+            "earthpower".to_string(),
+        ];
+        // Simulate post-aggregator s1 layout: winner first (MoveMega(M0)
+        // with high visits), rest by visits desc. Indices DO NOT align with
+        // s1_options anymore — pre-fix code paired s1[0] with
+        // s1_move_names[0] = "diamondstorm" → wrong best_move.
+        let aggregated = MctsResult {
+            s1: vec![
+                MctsSideResult {
+                    move_choice: MoveChoice::MoveMega(PokemonMoveIndex::M0),
+                    total_score: 600.0,
+                    visits: 1000,
+                },
+                MctsSideResult {
+                    move_choice: MoveChoice::Move(PokemonMoveIndex::M1),
+                    total_score: 300.0,
+                    visits: 500,
+                },
+                MctsSideResult {
+                    move_choice: MoveChoice::Move(PokemonMoveIndex::M0),
+                    total_score: 100.0,
+                    visits: 200,
+                },
+            ],
+            s2: vec![],
+            iteration_count: 1700,
+            principal_variation: vec![],
+        };
+        let su = build_stream_update("final", &aggregated, &s1_options, &s1_move_names);
+        assert_eq!(
+            su.best_move, "DIAMONDSTORM-MEGA",
+            "best_move must be resolved from move_choice (MoveMega(M0) → \"diamondstorm-mega\"), \
+             not from s1_move_names[0] (\"diamondstorm\")"
+        );
+        // Alternatives must also use lookup-by-MoveChoice, not by index.
+        let alt_moves: Vec<&str> = su.alternatives.iter().map(|a| a.move_name.as_str()).collect();
+        assert_eq!(
+            alt_moves,
+            vec!["EARTHPOWER", "DIAMONDSTORM"],
+            "alternatives must reflect each entry's actual move_choice (not whatever name happens \
+             to share its index in s1_options)"
+        );
+    }
+
+    /// Non-PIMC StreamUpdate (single-search path) must NOT emit `pimcBreakdown`
+    /// in its JSON — backward compatibility for existing consumers.
+    #[test]
+    fn test_non_pimc_stream_update_omits_breakdown() {
+        let su = StreamUpdate {
+            event: "final",
+            best_move: "EARTHQUAKE".to_string(),
+            confidence: 0.8,
+            sims: 100_000,
+            depth: 3,
+            pv: Vec::new(),
+            alternatives: Vec::new(),
+            message: None,
+            pimc_breakdown: None,
+        };
+        let json = serde_json::to_string(&su).expect("serialize");
+        assert!(
+            !json.contains("pimcBreakdown"),
+            "non-PIMC events must omit pimcBreakdown field, got: {}",
+            json
+        );
     }
 }
