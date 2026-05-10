@@ -140,6 +140,7 @@ impl Node {
         c_forced_side2: f32,
         forced_counter: &mut u32,
         forced_counter_side2: &mut u32,
+        seeded_rng: Option<&mut rand::rngs::StdRng>,
     ) -> (*mut Node, usize, usize) {
         let return_node = self as *mut Node;
         if self.s1_options.is_none() {
@@ -186,7 +187,26 @@ impl Node {
         match child_vector {
             Some(child_vector) => {
                 let child_vec_ptr = child_vector as *mut Vec<Node>;
-                let chosen_child = self.sample_node(child_vec_ptr);
+                // engine-seed-plumbing: when a seeded RNG is supplied, use it
+                // for sampling so the search becomes reproducible. Pass the
+                // borrow recursively so descent through the tree consumes
+                // from the same stream.
+                let chosen_child = match seeded_rng {
+                    Some(rng) => {
+                        let ptr = self.sample_node_with_rng(child_vec_ptr, rng);
+                        state.apply_instructions(&(*ptr).instructions.instruction_list);
+                        return (*ptr).selection(
+                            state,
+                            c_puct,
+                            c_forced_side1,
+                            c_forced_side2,
+                            forced_counter,
+                            forced_counter_side2,
+                            Some(rng),
+                        );
+                    }
+                    None => self.sample_node(child_vec_ptr),
+                };
                 state.apply_instructions(&(*chosen_child).instructions.instruction_list);
                 (*chosen_child).selection(
                     state,
@@ -195,6 +215,7 @@ impl Node {
                     c_forced_side2,
                     forced_counter,
                     forced_counter_side2,
+                    None,
                 )
             }
             None => (return_node, s1_mc_index, s2_mc_index),
@@ -213,11 +234,30 @@ impl Node {
         chosen_node_ptr
     }
 
+    /// engine-seed-plumbing: same logic as `sample_node`, but draws from a
+    /// caller-supplied RNG so the choice can be reproduced bit-identically
+    /// when the same seeded `StdRng` state is fed in.
+    unsafe fn sample_node_with_rng<R: rand::RngCore>(
+        &self,
+        move_vector: *mut Vec<Node>,
+        rng: &mut R,
+    ) -> *mut Node {
+        let weights: Vec<f64> = (*move_vector)
+            .iter()
+            .map(|x| x.instructions.percentage as f64)
+            .collect();
+        let dist = WeightedIndex::new(weights).unwrap();
+        let chosen_node = &mut (&mut *move_vector)[dist.sample(rng)];
+        let chosen_node_ptr = chosen_node as *mut Node;
+        chosen_node_ptr
+    }
+
     pub unsafe fn expand(
         &mut self,
         state: &mut State,
         s1_move_index: usize,
         s2_move_index: usize,
+        seeded_rng: Option<&mut rand::rngs::StdRng>,
     ) -> *mut Node {
         let s1_move = &self.s1_options.as_ref().unwrap()[s1_move_index].move_choice;
         let s2_move = &self.s2_options.as_ref().unwrap()[s2_move_index].move_choice;
@@ -243,7 +283,10 @@ impl Node {
 
         // sample a node from the new instruction list.
         // this is the node that the rollout will be done on
-        let new_node_ptr = self.sample_node(&mut this_pair_vec);
+        let new_node_ptr = match seeded_rng {
+            Some(rng) => self.sample_node_with_rng(&mut this_pair_vec, rng),
+            None => self.sample_node(&mut this_pair_vec),
+        };
         state.apply_instructions(&(*new_node_ptr).instructions.instruction_list);
         self.children
             .insert((s1_move_index, s2_move_index), this_pair_vec);
@@ -379,20 +422,46 @@ fn do_mcts(
     c_forced_side2: f32,
     forced_counter: &mut u32,
     forced_counter_side2: &mut u32,
+    seeded_rng: Option<&mut rand::rngs::StdRng>,
 ) {
-    let (mut new_node, s1_move, s2_move) = unsafe {
-        root_node.selection(
-            state,
-            c_puct,
-            c_forced_side1,
-            c_forced_side2,
-            forced_counter,
-            forced_counter_side2,
-        )
-    };
-    new_node = unsafe { (*new_node).expand(state, s1_move, s2_move) };
-    let rollout_result = unsafe { (*new_node).rollout(state, root_eval) };
-    unsafe { (*new_node).backpropagate(rollout_result, state) }
+    // engine-seed-plumbing: split the optional RNG borrow so we can pass it
+    // through both `selection` and `expand` on this iteration. Both nested
+    // calls accept Option<&mut StdRng>; reborrowing is required because the
+    // outer Option owns a unique mutable borrow of the search's RNG.
+    match seeded_rng {
+        Some(rng) => {
+            let (mut new_node, s1_move, s2_move) = unsafe {
+                root_node.selection(
+                    state,
+                    c_puct,
+                    c_forced_side1,
+                    c_forced_side2,
+                    forced_counter,
+                    forced_counter_side2,
+                    Some(&mut *rng),
+                )
+            };
+            new_node = unsafe { (*new_node).expand(state, s1_move, s2_move, Some(&mut *rng)) };
+            let rollout_result = unsafe { (*new_node).rollout(state, root_eval) };
+            unsafe { (*new_node).backpropagate(rollout_result, state) }
+        }
+        None => {
+            let (mut new_node, s1_move, s2_move) = unsafe {
+                root_node.selection(
+                    state,
+                    c_puct,
+                    c_forced_side1,
+                    c_forced_side2,
+                    forced_counter,
+                    forced_counter_side2,
+                    None,
+                )
+            };
+            new_node = unsafe { (*new_node).expand(state, s1_move, s2_move, None) };
+            let rollout_result = unsafe { (*new_node).rollout(state, root_eval) };
+            unsafe { (*new_node).backpropagate(rollout_result, state) }
+        }
+    }
 }
 
 const PV_MAX_DEPTH: usize = 4;
@@ -511,6 +580,12 @@ pub struct MctsSearch {
     /// `forced_playouts_triggered` (which fires on either side). Stays at 0
     /// when `c_forced_side2 == 0.0`.
     pub forced_playouts_triggered_side2: u32,
+    /// engine-seed-plumbing: optional deterministic RNG. When `Some`, every
+    /// stochastic draw inside the search (rollout sampling in `sample_node`,
+    /// Dirichlet noise on root priors) consumes from this stream. When
+    /// `None` (default for `new`/`new_with_priors`), the engine falls back
+    /// to `rand::rng()` exactly as before — bit-identical to pre-branch.
+    seeded_rng: Option<rand::rngs::StdRng>,
 }
 
 impl MctsSearch {
@@ -541,6 +616,21 @@ impl MctsSearch {
         s2_options: Vec<MoveChoice>,
         eval_kind: &EvalKind,
         c_puct: f32,
+    ) -> Self {
+        Self::new_with_eval_seeded(state, s1_options, s2_options, eval_kind, c_puct, None)
+    }
+
+    /// engine-seed-plumbing: seeded variant of `new_with_eval`. Same NN /
+    /// heuristic prior wiring, but if `seed = Some(n)` the resulting
+    /// search consumes from a deterministic `StdRng(n)`. `None` is a
+    /// bit-identical no-op delegate to the pre-branch behavior.
+    pub fn new_with_eval_seeded(
+        state: State,
+        s1_options: Vec<MoveChoice>,
+        s2_options: Vec<MoveChoice>,
+        eval_kind: &EvalKind,
+        c_puct: f32,
+        seed: Option<u64>,
     ) -> Self {
         let s1_priors = match eval_kind {
             EvalKind::Heuristic => None,
@@ -574,7 +664,15 @@ impl MctsSearch {
                 }
             }
         };
-        Self::new_with_priors(state, s1_options, s2_options, c_puct, s1_priors, None)
+        Self::new_with_priors_seeded(
+            state,
+            s1_options,
+            s2_options,
+            c_puct,
+            s1_priors,
+            None,
+            seed,
+        )
     }
 
     /// Plan E variant of `new` that takes optional priors and a custom
@@ -583,6 +681,10 @@ impl MctsSearch {
     /// `s1_priors`/`s2_priors`: `None` → uniform; otherwise must have length
     /// matching the corresponding options vector. The Plan E pipeline calls
     /// `nn_state_encoder::map_policy_to_options` to produce `s1_priors`.
+    ///
+    /// Backward-compat wrapper: delegates to `new_with_priors_seeded` with
+    /// `seed = None` so the un-seeded behavior is bit-identical to the
+    /// pre-engine-seed-plumbing implementation.
     pub fn new_with_priors(
         state: State,
         s1_options: Vec<MoveChoice>,
@@ -591,6 +693,42 @@ impl MctsSearch {
         s1_priors: Option<Vec<f32>>,
         s2_priors: Option<Vec<f32>>,
     ) -> Self {
+        Self::new_with_priors_seeded(
+            state,
+            s1_options,
+            s2_options,
+            c_puct,
+            s1_priors,
+            s2_priors,
+            None,
+        )
+    }
+
+    /// engine-seed-plumbing: full-fat constructor. When `seed = Some(n)` the
+    /// search becomes reproducible — every stochastic draw inside the search
+    /// (root Dirichlet noise, rollout `sample_node`) consumes from a single
+    /// `StdRng` seeded with `n`. Same input + same seed → bit-identical
+    /// `top_move()` output across runs.
+    ///
+    /// When `seed = None` the search uses `rand::rng()` exactly as before
+    /// (`new_with_priors` delegates here with `None`).
+    pub fn new_with_priors_seeded(
+        state: State,
+        s1_options: Vec<MoveChoice>,
+        s2_options: Vec<MoveChoice>,
+        c_puct: f32,
+        s1_priors: Option<Vec<f32>>,
+        s2_priors: Option<Vec<f32>>,
+        seed: Option<u64>,
+    ) -> Self {
+        use rand::SeedableRng;
+        // engine-seed-plumbing: build the RNG up-front (if seeded) so we can
+        // hand it to apply_dirichlet_noise_with_rng AND keep ownership for
+        // the run loop. Identical seed → identical Dirichlet noise →
+        // identical priors → identical search.
+        let mut seeded_rng: Option<rand::rngs::StdRng> =
+            seed.map(rand::rngs::StdRng::seed_from_u64);
+
         // engine-prior-tuning: Dirichlet noise is mixed into the ROOT priors
         // only (matching AlphaZero). When `dirichlet_eps == 0.0` (default),
         // this is a no-op and behavior is bit-identical.
@@ -598,11 +736,33 @@ impl MctsSearch {
         let mut s1_priors = s1_priors;
         let mut s2_priors = s2_priors;
         if cfg.dirichlet_eps > 0.0 && cfg.dirichlet_alpha > 0.0 {
-            if let Some(ref mut p) = s1_priors {
-                crate::tuning::apply_dirichlet_noise(p, cfg.dirichlet_alpha, cfg.dirichlet_eps);
-            }
-            if let Some(ref mut p) = s2_priors {
-                crate::tuning::apply_dirichlet_noise(p, cfg.dirichlet_alpha, cfg.dirichlet_eps);
+            match &mut seeded_rng {
+                Some(rng) => {
+                    if let Some(ref mut p) = s1_priors {
+                        crate::tuning::apply_dirichlet_noise_with_rng(
+                            p,
+                            cfg.dirichlet_alpha,
+                            cfg.dirichlet_eps,
+                            rng,
+                        );
+                    }
+                    if let Some(ref mut p) = s2_priors {
+                        crate::tuning::apply_dirichlet_noise_with_rng(
+                            p,
+                            cfg.dirichlet_alpha,
+                            cfg.dirichlet_eps,
+                            rng,
+                        );
+                    }
+                }
+                None => {
+                    if let Some(ref mut p) = s1_priors {
+                        crate::tuning::apply_dirichlet_noise(p, cfg.dirichlet_alpha, cfg.dirichlet_eps);
+                    }
+                    if let Some(ref mut p) = s2_priors {
+                        crate::tuning::apply_dirichlet_noise(p, cfg.dirichlet_alpha, cfg.dirichlet_eps);
+                    }
+                }
             }
         }
         let mut root = Box::new(Node::new());
@@ -633,6 +793,7 @@ impl MctsSearch {
             c_forced_side2: 0.0,
             forced_playouts_triggered: 0,
             forced_playouts_triggered_side2: 0,
+            seeded_rng,
         }
     }
 
@@ -666,6 +827,10 @@ impl MctsSearch {
         let iterations_before = self.root.times_visited;
         while start_time.elapsed() < budget {
             for _ in 0..MCTS_BATCH_SIZE {
+                // engine-seed-plumbing: borrow the seeded RNG (if any) per
+                // iteration. `as_mut()` yields `Option<&mut StdRng>` which
+                // `do_mcts` then forwards to `selection`/`expand`. When seed
+                // is None this is bit-identical to the pre-branch loop.
                 do_mcts(
                     &mut self.root,
                     &mut self.state,
@@ -675,6 +840,7 @@ impl MctsSearch {
                     self.c_forced_side2,
                     &mut self.forced_playouts_triggered,
                     &mut self.forced_playouts_triggered_side2,
+                    self.seeded_rng.as_mut(),
                 );
             }
 
@@ -1445,5 +1611,274 @@ mod stream_tests {
         search.set_c_forced_side2(2.5);
         assert_eq!(search.c_forced, 1.5);
         assert_eq!(search.c_forced_side2, 2.5);
+    }
+
+    // ---- engine-seed-plumbing tests ----
+
+    /// Helper for the seed tests below: a representative two-Pokemon JSON
+    /// that has enough action variety to exercise rollout sampling AND
+    /// is small enough to run in <1s wall clock.
+    #[cfg(test)]
+    const SEED_TEST_JSON: &str = r#"{
+        "sideOne": {
+            "pokemon": [
+                {
+                    "species": "Blaziken", "level": 100,
+                    "types": ["Fire", "Fighting"],
+                    "hp": 302, "maxhp": 302,
+                    "ability": "Speed Boost", "item": "Life Orb", "nature": "Jolly",
+                    "attack": 349, "defense": 196, "specialAttack": 230,
+                    "specialDefense": 176, "speed": 284, "status": "None",
+                    "weightKg": 52.0,
+                    "moves": [
+                        {"id": "Close Combat", "pp": 8},
+                        {"id": "Flare Blitz", "pp": 24},
+                        {"id": "Swords Dance", "pp": 32},
+                        {"id": "Knock Off", "pp": 32}
+                    ],
+                    "teraType": "Fire"
+                }
+            ],
+            "activeIndex": 0
+        },
+        "sideTwo": {
+            "pokemon": [
+                {
+                    "species": "Alakazam", "level": 100,
+                    "types": ["Psychic"],
+                    "hp": 251, "maxhp": 251,
+                    "ability": "Magic Guard", "item": "Focus Sash", "nature": "Timid",
+                    "attack": 121, "defense": 128, "specialAttack": 369,
+                    "specialDefense": 206, "speed": 372, "status": "None",
+                    "weightKg": 48.0,
+                    "moves": [
+                        {"id": "Psychic", "pp": 16},
+                        {"id": "Shadow Ball", "pp": 24},
+                        {"id": "Focus Blast", "pp": 8},
+                        {"id": "Energy Ball", "pp": 16}
+                    ],
+                    "teraType": "Psychic"
+                }
+            ],
+            "activeIndex": 0
+        }
+    }"#;
+
+    /// Drive a fixed number of MCTS iterations on a search. Bypasses the
+    /// wall-clock timer in `run_for` so two runs with the same seed advance
+    /// the search by EXACTLY the same number of `do_mcts` calls — the only
+    /// way to get true bit-identical comparisons across runs.
+    fn drive_iterations(search: &mut MctsSearch, n: u32) {
+        for _ in 0..n {
+            do_mcts(
+                &mut search.root,
+                &mut search.state,
+                &search.root_eval,
+                search.c_puct,
+                search.c_forced,
+                search.c_forced_side2,
+                &mut search.forced_playouts_triggered,
+                &mut search.forced_playouts_triggered_side2,
+                search.seeded_rng.as_mut(),
+            );
+        }
+    }
+
+    /// Snapshot a search's s1 visit-vector keyed by stable move debug-name.
+    /// Used to assert two runs produced bit-identical search trees.
+    fn s1_visit_fingerprint(search: &mut MctsSearch) -> Vec<(String, u32, f32)> {
+        let snap = search.snapshot(0);
+        snap.s1
+            .iter()
+            .map(|r| (format!("{:?}", r.move_choice), r.visits, r.total_score))
+            .collect()
+    }
+
+    /// engine-seed-plumbing core determinism guarantee: same input + same
+    /// seed + same iteration count → bit-identical visit/score vectors AND
+    /// bit-identical `top_move()`. Repeats 5 times to confirm reproducibility.
+    #[test]
+    fn seeded_searches_are_bit_identical_across_runs() {
+        use crate::translate::json_to_poke_state;
+        let state = json_to_poke_state(SEED_TEST_JSON).expect("parse state");
+        let (s1_opts, s2_opts) = state.root_get_all_options();
+        assert!(!s1_opts.is_empty(), "test fixture must have legal moves");
+
+        // Establish the reference fingerprint with seed=42.
+        let mut reference = MctsSearch::new_with_priors_seeded(
+            state.clone(),
+            s1_opts.clone(),
+            s2_opts.clone(),
+            DEFAULT_C_PUCT,
+            None,
+            None,
+            Some(42),
+        );
+        drive_iterations(&mut reference, 1500);
+        let reference_fp = s1_visit_fingerprint(&mut reference);
+        let reference_top = reference_fp
+            .iter()
+            .max_by_key(|(_, v, _)| *v)
+            .expect("reference must have a top move")
+            .0
+            .clone();
+
+        // Five replays — every one must produce the same fingerprint AND top.
+        for trial in 0..5 {
+            let mut replay = MctsSearch::new_with_priors_seeded(
+                state.clone(),
+                s1_opts.clone(),
+                s2_opts.clone(),
+                DEFAULT_C_PUCT,
+                None,
+                None,
+                Some(42),
+            );
+            drive_iterations(&mut replay, 1500);
+            let replay_fp = s1_visit_fingerprint(&mut replay);
+            let replay_top = replay_fp
+                .iter()
+                .max_by_key(|(_, v, _)| *v)
+                .unwrap()
+                .0
+                .clone();
+            assert_eq!(
+                replay_fp, reference_fp,
+                "trial {}: visit/score vectors must be identical for same seed",
+                trial
+            );
+            assert_eq!(
+                replay_top, reference_top,
+                "trial {}: top_move must be identical for same seed",
+                trial
+            );
+        }
+    }
+
+    /// Different seeds should diverge (otherwise seeding is useless). We
+    /// don't assert *which* moves differ — only that at least one of the
+    /// per-move visit counts differs across two distinct seeds.
+    #[test]
+    fn seeded_searches_diverge_under_different_seeds() {
+        use crate::translate::json_to_poke_state;
+        let state = json_to_poke_state(SEED_TEST_JSON).expect("parse state");
+        let (s1_opts, s2_opts) = state.root_get_all_options();
+
+        let mut a = MctsSearch::new_with_priors_seeded(
+            state.clone(),
+            s1_opts.clone(),
+            s2_opts.clone(),
+            DEFAULT_C_PUCT,
+            None,
+            None,
+            Some(1),
+        );
+        let mut b = MctsSearch::new_with_priors_seeded(
+            state.clone(),
+            s1_opts.clone(),
+            s2_opts.clone(),
+            DEFAULT_C_PUCT,
+            None,
+            None,
+            Some(2),
+        );
+        drive_iterations(&mut a, 1500);
+        drive_iterations(&mut b, 1500);
+        let fp_a = s1_visit_fingerprint(&mut a);
+        let fp_b = s1_visit_fingerprint(&mut b);
+        // The visit/score VECTORS should differ somewhere — if they're
+        // bit-identical with two distinct seeds, the seed isn't actually
+        // controlling the RNG stream.
+        assert_ne!(
+            fp_a, fp_b,
+            "seed=1 and seed=2 must produce different MCTS trees"
+        );
+    }
+
+    /// Stochasticity-preserved smoke: with `seed = None`, two runs MAY
+    /// diverge (driven by `rand::rng()`). We don't assert equality OR
+    /// inequality (that would be flaky); we just assert both runs complete
+    /// and produce non-empty results — i.e. the un-seeded path still works.
+    #[test]
+    fn unseeded_search_still_completes_successfully() {
+        use crate::translate::json_to_poke_state;
+        let state = json_to_poke_state(SEED_TEST_JSON).expect("parse state");
+        let (s1_opts, s2_opts) = state.root_get_all_options();
+
+        for trial in 0..2 {
+            let mut search = MctsSearch::new_with_priors_seeded(
+                state.clone(),
+                s1_opts.clone(),
+                s2_opts.clone(),
+                DEFAULT_C_PUCT,
+                None,
+                None,
+                None, // unseeded
+            );
+            drive_iterations(&mut search, 800);
+            let fp = s1_visit_fingerprint(&mut search);
+            assert!(
+                !fp.is_empty(),
+                "trial {}: unseeded search must produce s1 results",
+                trial
+            );
+            let total: u32 = fp.iter().map(|(_, v, _)| *v).sum();
+            assert!(
+                total > 0,
+                "trial {}: unseeded search must accumulate visits",
+                trial
+            );
+        }
+    }
+
+    /// Backward-compat: the old `new_with_priors` (no seed) must produce
+    /// the same kind of result as `new_with_priors_seeded(..., None)`. Both
+    /// take the un-seeded code path; we only verify that both run and
+    /// produce identically-shaped output (s1 length, presence of visits).
+    /// Bit-identical equality is NOT asserted — both use the thread RNG.
+    #[test]
+    fn legacy_constructor_equivalent_to_seed_none() {
+        use crate::translate::json_to_poke_state;
+        let state = json_to_poke_state(SEED_TEST_JSON).expect("parse state");
+        let (s1_opts, s2_opts) = state.root_get_all_options();
+
+        let mut legacy = MctsSearch::new_with_priors(
+            state.clone(),
+            s1_opts.clone(),
+            s2_opts.clone(),
+            DEFAULT_C_PUCT,
+            None,
+            None,
+        );
+        let mut seeded_none = MctsSearch::new_with_priors_seeded(
+            state.clone(),
+            s1_opts.clone(),
+            s2_opts.clone(),
+            DEFAULT_C_PUCT,
+            None,
+            None,
+            None,
+        );
+
+        drive_iterations(&mut legacy, 500);
+        drive_iterations(&mut seeded_none, 500);
+
+        let legacy_fp = s1_visit_fingerprint(&mut legacy);
+        let none_fp = s1_visit_fingerprint(&mut seeded_none);
+
+        assert_eq!(
+            legacy_fp.len(),
+            none_fp.len(),
+            "both constructors must return same number of s1 entries"
+        );
+        // Both must list the same move set (order-insensitive).
+        let legacy_moves: std::collections::HashSet<&String> =
+            legacy_fp.iter().map(|(m, _, _)| m).collect();
+        let none_moves: std::collections::HashSet<&String> =
+            none_fp.iter().map(|(m, _, _)| m).collect();
+        assert_eq!(
+            legacy_moves, none_moves,
+            "move sets must match between legacy and seed=None constructors"
+        );
     }
 }

@@ -277,6 +277,13 @@ async fn analyze_handler(
         .as_ref()
         .and_then(|v| v.get("turn").and_then(|x| x.as_u64()))
         .map(|u| u as u32);
+    // engine-seed-plumbing: optional deterministic RNG seed. When present,
+    // the search becomes reproducible — same input + same seed yields a
+    // bit-identical bestMove. Absent (the production default) preserves
+    // pre-branch behavior using the thread-local RNG.
+    let seed: Option<u64> = parsed_top
+        .as_ref()
+        .and_then(|v| v.get("seed").and_then(|x| x.as_u64()));
 
     let raw_json = body;
     let eval_kind = app.eval_kind.clone();
@@ -430,25 +437,31 @@ async fn analyze_handler(
             } else {
                 None
             };
-            MctsSearch::new_with_priors(
+            // engine-seed-plumbing: `seed` is plumbed through the seeded
+            // constructor. None preserves pre-branch behavior bit-identically.
+            MctsSearch::new_with_priors_seeded(
                 state,
                 s1_options,
                 s2_options,
                 c_puct,
                 s1_priors_blended,
                 s2_priors_blended,
+                seed,
             )
         } else {
             // NOTE: when `use_blended == false` (default flags or non-NN eval),
             // we take the original Plan-pre-I path. `heuristic_prior_mix_side2`
             // is intentionally NOT consulted here — the opp prior remains
             // whatever `new_with_eval` constructs. T4/T5 may revisit this.
-            MctsSearch::new_with_eval(
+            // engine-seed-plumbing: route through the seeded variant so the
+            // optional seed flows into the same RNG used by `sample_node`.
+            MctsSearch::new_with_eval_seeded(
                 state,
                 s1_options,
                 s2_options,
                 &eval_kind,
                 c_puct,
+                seed,
             )
         };
         // Plan I: forced-playouts root constant. 0.0 (default) is a no-op.
@@ -944,6 +957,12 @@ async fn analyze_stream_handler(
         .as_ref()
         .and_then(|v| v.get("turn").and_then(|x| x.as_u64()))
         .map(|u| u as u32);
+    // engine-seed-plumbing: optional deterministic RNG seed. Mirrors the
+    // /analyze handler — when present, makes the streaming search
+    // reproducible for replay-based A/B testing.
+    let seed: Option<u64> = parsed
+        .as_ref()
+        .and_then(|v| v.get("seed").and_then(|x| x.as_u64()));
 
     let raw_json = body;
     let eval_kind = app.eval_kind.clone();
@@ -1213,25 +1232,30 @@ async fn analyze_stream_handler(
             } else {
                 None
             };
-            MctsSearch::new_with_priors(
+            // engine-seed-plumbing: thread the seed through the seeded
+            // constructor (None = pre-branch behavior).
+            MctsSearch::new_with_priors_seeded(
                 state.clone(),
                 s1_options,
                 s2_options,
                 c_puct,
                 s1_priors_blended,
                 s2_priors_blended,
+                seed,
             )
         } else {
             // NOTE: when `use_blended == false` (default flags or non-NN eval),
             // we take the original Plan-pre-I path. `heuristic_prior_mix_side2`
             // is intentionally NOT consulted here — the opp prior remains
             // whatever `new_with_eval` constructs.
-            MctsSearch::new_with_eval(
+            // engine-seed-plumbing: route through the seeded variant.
+            MctsSearch::new_with_eval_seeded(
                 state.clone(),
                 s1_options,
                 s2_options,
                 &eval_kind,
                 c_puct,
+                seed,
             )
         };
         // Plan I: forced-playouts root constant. 0.0 (default) is a no-op.

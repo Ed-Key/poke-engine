@@ -77,12 +77,31 @@ pub fn sample_dirichlet(alpha: f32, n: usize, rng: &mut impl rand::RngCore) -> V
 /// Mix Dirichlet noise into priors:
 ///   `priors[i] = (1-eps)*priors[i] + eps*dirichlet[i]`
 /// Caller is responsible for ensuring eps and alpha are in valid ranges.
+///
+/// Uses the thread-local RNG. For deterministic-seed flows, see
+/// `apply_dirichlet_noise_with_rng` which accepts an explicit RNG.
 pub fn apply_dirichlet_noise(priors: &mut [f32], alpha: f32, eps: f32) {
     if eps <= 0.0 || alpha <= 0.0 || priors.is_empty() {
         return;
     }
     let mut rng = rand::rng();
-    let noise = sample_dirichlet(alpha, priors.len(), &mut rng);
+    apply_dirichlet_noise_with_rng(priors, alpha, eps, &mut rng);
+}
+
+/// Same as `apply_dirichlet_noise` but uses an explicitly provided RNG.
+/// Engine-seed-plumbing entry point: when the caller has a seeded `StdRng`,
+/// pass it here so the noise becomes reproducible. Behavior with a fresh
+/// `rand::rng()` is bit-identical to `apply_dirichlet_noise`.
+pub fn apply_dirichlet_noise_with_rng<R: rand::RngCore>(
+    priors: &mut [f32],
+    alpha: f32,
+    eps: f32,
+    rng: &mut R,
+) {
+    if eps <= 0.0 || alpha <= 0.0 || priors.is_empty() {
+        return;
+    }
+    let noise = sample_dirichlet(alpha, priors.len(), rng);
     let eps = eps.clamp(0.0, 1.0);
     for (p, n) in priors.iter_mut().zip(noise.iter()) {
         *p = (1.0 - eps) * *p + eps * *n;
