@@ -197,8 +197,33 @@ fn extract_hypotheses(body: &str) -> Option<Vec<String>> {
     Some(arr.iter().map(|h| h.to_string()).collect())
 }
 
+/// Per-hypothesis output from a PIMC worker. Carries the MCTS result plus the
+/// telemetry needed to surface the heuristic-prior signal in the aggregated
+/// PIMC engine-instrument line. Issue 2 + 3 fix (2026-05-13): without these
+/// fields the PIMC code path had no way to plumb heuristic_pick_switch /
+/// prior_blend_per_top5 into the instrumentation, so `heuristic_pick_switch`
+/// was always None for label=pimc, hiding the engine's real switch advice
+/// from observability.
+struct HypothesisResult {
+    mcts: poke_engine::mcts::MctsResult,
+    opp_summary: Option<String>,
+    /// Heuristic prior computed for this hypothesis (None when --heuristic-prior-mix==0
+    /// or NN is not active — the same gate as the single-modal use_blended path).
+    heuristic: Option<poke_engine::heuristic_prior::HeuristicPrior>,
+    /// Raw 13-slot NN policy probabilities. Empty when the NN wasn't queried.
+    raw_nn_probs: Vec<f32>,
+    /// Blended priors over s1_options, in the same order as s1_options.
+    /// Empty when use_blended was false.
+    s1_priors_blended: Vec<f32>,
+    /// Player-side state at root (same across all K hypotheses since PIMC
+    /// only varies opp). Kept owned so the aggregator can build telemetry
+    /// references after the join.
+    state: poke_engine::state::State,
+}
+
 /// Spawn one PIMC worker thread. Each parses its own hypothesis JSON and runs
-/// its own MctsSearch end-to-end. Returns a JoinHandle wrapping Result<MctsResult, String>.
+/// its own MctsSearch end-to-end. Returns a JoinHandle wrapping
+/// Result<HypothesisResult, String>.
 ///
 /// Plan E: each worker calls the NN sidecar at the root for ITS hypothesis,
 /// using the shared `eval_kind`. This is per the verifier's R-MISSING-1 note:
@@ -206,13 +231,27 @@ fn extract_hypotheses(body: &str) -> Option<Vec<String>> {
 /// workers each issuing one /policy call is fine for K up to ~8 — the wall
 /// clock is K × ~19ms inside the sidecar, parallelizable as far as the GIL
 /// allows.
+///
+/// Issue 2 fix (2026-05-13): heuristic-prior pipeline is now wired into PIMC
+/// workers, mirroring single-modal's use_blended path. When
+/// heuristic_prior_mix > 0.0 AND NN is active, each worker computes its own
+/// heuristic prior, blends with NN, and passes the blended priors to
+/// MctsSearch::new_with_priors_seeded. Without this fix PIMC ran on pure NN
+/// policy and the engine's heuristic switch advice (e.g. "switch to Iron
+/// Valiant to handle Dracozolt") never surfaced.
+#[allow(clippy::too_many_arguments)]
 fn handles_spawn(
     hypothesis_json: String,
     budget_ms: u64,
-    _seed: u64,
+    seed: u64,
     eval_kind: EvalKind,
     c_puct: f32,
-) -> std::thread::JoinHandle<Result<(poke_engine::mcts::MctsResult, Option<String>), String>> {
+    heuristic_prior_mix: f32,
+    heuristic_prior_mass_dmg: f32,
+    heuristic_prior_mass_switch: f32,
+    forced_playouts_c: f32,
+    forced_playouts_c_side2: f32,
+) -> std::thread::JoinHandle<Result<HypothesisResult, String>> {
     use std::time::{Duration, Instant};
 
     std::thread::spawn(move || {
@@ -230,10 +269,6 @@ fn handles_spawn(
         // because PIMC currently varies only opp identity, not player.
         let opp_summary = {
             let active = state.side_two.get_active_immutable();
-            // Display: "<Species> @ <Item> / <Ability>"
-            // Item/Ability serialize to lowercased internal identifiers; the
-            // copilot UI capitalizes for display. We keep the raw string here
-            // and let the consumer prettify.
             Some(format!(
                 "{} @ {:?} / {:?}",
                 format!("{:?}", active.id),
@@ -242,19 +277,90 @@ fn handles_spawn(
             ))
         };
 
-        let mut search = MctsSearch::new_with_eval(
-            state.clone(),
-            s1_options,
-            s2_options,
-            &eval_kind,
-            c_puct,
-        );
+        // Issue 2 fix: mirror single-modal's use_blended path. Same gate.
+        let use_blended = heuristic_prior_mix > 0.0 && eval_kind.uses_nn();
+
+        // Captured outputs we hand back via HypothesisResult.
+        let mut out_heuristic: Option<poke_engine::heuristic_prior::HeuristicPrior> = None;
+        let mut out_raw_nn_probs: Vec<f32> = Vec::new();
+        let mut out_s1_priors_blended: Vec<f32> = Vec::new();
+        let state_for_result = state.clone();
+
+        let mut search = if use_blended {
+            let client = match &eval_kind {
+                poke_engine::eval_kind::EvalKind::Nn(c) => c.clone(),
+                _ => unreachable!("guarded by uses_nn() above"),
+            };
+            let heuristic = poke_engine::heuristic_prior::compute(
+                &state,
+                poke_engine::nn_state_encoder::SidePerspective::Side1,
+                &s1_options,
+                heuristic_prior_mass_dmg,
+                heuristic_prior_mass_switch,
+            );
+            let s1_priors_blended = {
+                let json = poke_engine::nn_state_encoder::encode(
+                    &state,
+                    poke_engine::nn_state_encoder::SidePerspective::Side1,
+                );
+                match client.policy(&json, poke_engine::nn_client::Perspective::P1) {
+                    Ok(resp) => {
+                        out_raw_nn_probs = resp.probs.clone();
+                        let blended = poke_engine::nn_state_encoder::map_policy_to_options_blended(
+                            &resp.probs,
+                            &state,
+                            poke_engine::nn_state_encoder::SidePerspective::Side1,
+                            &s1_options,
+                            heuristic.as_ref(),
+                            heuristic_prior_mix,
+                        );
+                        out_s1_priors_blended = blended.clone();
+                        Some(blended)
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "PIMC worker: NN client failed at root: {} — falling back to uniform priors",
+                            e
+                        );
+                        None
+                    }
+                }
+            };
+            out_heuristic = heuristic;
+            MctsSearch::new_with_priors_seeded(
+                state,
+                s1_options,
+                s2_options,
+                c_puct,
+                s1_priors_blended,
+                None,
+                Some(seed),
+            )
+        } else {
+            // Original Plan-pre-I path. Preserved for the
+            // heuristic_prior_mix == 0 case and for non-NN eval kinds.
+            MctsSearch::new_with_eval_seeded(
+                state,
+                s1_options,
+                s2_options,
+                &eval_kind,
+                c_puct,
+                Some(seed),
+            )
+        };
+        search.set_c_forced(forced_playouts_c);
+        search.set_c_forced_side2(forced_playouts_c_side2);
+
         let start = Instant::now();
         search.run_for(Duration::from_millis(budget_ms));
-        Ok((
-            search.snapshot(start.elapsed().as_millis() as u64),
+        Ok(HypothesisResult {
+            mcts: search.snapshot(start.elapsed().as_millis() as u64),
             opp_summary,
-        ))
+            heuristic: out_heuristic,
+            raw_nn_probs: out_raw_nn_probs,
+            s1_priors_blended: out_s1_priors_blended,
+            state: state_for_result,
+        })
     })
 }
 
@@ -1163,6 +1269,10 @@ async fn analyze_stream_handler(
             let per_hypothesis_budget = time_limit_ms / (k as u64).max(1);
 
             // Spawn K worker threads; each owns one hypothesis end-to-end.
+            // Issue 2 fix: forward heuristic-prior flags so each worker can
+            // mirror the single-modal use_blended path. Issue 3 fix: workers
+            // return HypothesisResult which carries the heuristic + raw NN
+            // probs needed for instrumented PIMC log lines.
             let mut handles = Vec::with_capacity(k);
             for (i, hyp_json) in hypotheses.into_iter().enumerate() {
                 let h = handles_spawn(
@@ -1171,20 +1281,26 @@ async fn analyze_stream_handler(
                     i as u64,
                     eval_kind.clone(),
                     c_puct,
+                    heuristic_prior_mix,
+                    heuristic_prior_mass_dmg,
+                    heuristic_prior_mass_switch,
+                    forced_playouts_c,
+                    forced_playouts_c_side2,
                 );
                 handles.push(h);
             }
             // Join all. If any worker errored, abort PIMC and emit error.
-            // P4: workers now return (MctsResult, Option<String>) — second
-            // element is the per-hypothesis opp summary used for the
-            // copilot UI vote-bar.
+            // Workers return HypothesisResult { mcts, opp_summary, heuristic,
+            // raw_nn_probs, s1_priors_blended, state, s1_options, s2_options }.
             let mut results = Vec::with_capacity(k);
             let mut hyp_summaries: Vec<Option<String>> = Vec::with_capacity(k);
+            let mut hyp_telemetry: Vec<HypothesisResult> = Vec::with_capacity(k);
             for h in handles {
                 match h.join() {
-                    Ok(Ok((r, summary))) => {
-                        results.push(r);
-                        hyp_summaries.push(summary);
+                    Ok(Ok(hr)) => {
+                        results.push(hr.mcts.clone());
+                        hyp_summaries.push(hr.opp_summary.clone());
+                        hyp_telemetry.push(hr);
                     }
                     Ok(Err(msg)) => {
                         let _ = emit(&tx, &error_stream_update(format!("PIMC worker error: {}", msg)));
@@ -1276,18 +1392,26 @@ async fn analyze_stream_handler(
                 };
             // [ENGINE-INSTRUMENT] for PIMC aggregated result. Eval breakdown
             // is from the FIRST hypothesis (same player-side state across K).
-            // PIMC path doesn't (yet) participate in Plan I blending — pass
-            // empty telemetry so the new fields are present-but-neutral.
-            // Override the correlation keys so the PIMC log line still joins
-            // back to the postmortem on (battle_id, turn).
+            //
+            // Issue 3 fix (2026-05-13): PIMC now participates in Plan I
+            // blending — populate heuristic + NN + blended priors from the
+            // first hypothesis's worker output. All K hypotheses share the
+            // SAME player-side team (PIMC only varies opp), so the heuristic
+            // prior is identical across them; using h0 is sufficient for
+            // observability. Without this fix, heuristic_pick_switch was
+            // always None for label=pimc and the engine's real switch advice
+            // was invisible to the debug log + extension panel.
             let mut pimc_telemetry = InstrumentTelemetry::empty(0);
             pimc_telemetry.battle_id = battle_id.as_deref();
             pimc_telemetry.turn = turn;
-            // Telemetry path also needs s1_options + s2_options for name
-            // lookup (the emit_engine_instrument fix below resolves names by
-            // MoveChoice).
             pimc_telemetry.s1_options = &s1_options_pimc;
             pimc_telemetry.s2_options = &s2_options_pimc;
+            if let Some(h0) = hyp_telemetry.first() {
+                pimc_telemetry.raw_nn_probs = &h0.raw_nn_probs;
+                pimc_telemetry.heuristic = h0.heuristic.as_ref();
+                pimc_telemetry.s1_priors_blended = &h0.s1_priors_blended;
+                pimc_telemetry.state = Some(&h0.state);
+            }
             emit_engine_instrument(
                 &pimc_eval_breakdown,
                 &aggregated,
