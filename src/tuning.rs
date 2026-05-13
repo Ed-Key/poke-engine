@@ -28,6 +28,10 @@ pub struct TuningConfig {
     pub dirichlet_alpha: f32,
     pub dirichlet_eps: f32,
     pub eval_slope: f32,
+    /// Mask 0-damage moves out of the NN prior before PUCT consumes it.
+    /// Killswitch for the immunity-aware prior shipped to fix the
+    /// Shadow-Ball-into-Lopunny class of bugs. Default: enabled.
+    pub mask_zero_effect: bool,
 }
 
 impl Default for TuningConfig {
@@ -37,6 +41,7 @@ impl Default for TuningConfig {
             dirichlet_alpha: 0.0,
             dirichlet_eps: 0.0,
             eval_slope: 0.0125,
+            mask_zero_effect: true,
         }
     }
 }

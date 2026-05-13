@@ -37,11 +37,13 @@ use std::collections::HashSet;
 
 use serde_json::{json, Value};
 
+use crate::choices::{Choices, MoveCategory};
+use crate::engine::damage_calc::{calculate_damage, DamageRolls};
 use crate::engine::state::{MoveChoice, PokemonVolatileStatus};
 use crate::nn_client::{Perspective, ACTION_DIM};
 use crate::state::{
-    Move, Pokemon, PokemonIndex, PokemonMoveIndex, Side, SideConditions, State, StateTerrain,
-    StateTrickRoom, StateWeather,
+    Move, Pokemon, PokemonIndex, PokemonMoveIndex, Side, SideConditions, SideReference, State,
+    StateTerrain, StateTrickRoom, StateWeather,
 };
 
 /// Policy-relevant volatile statuses we forward to the sidecar / NN policy.
@@ -332,6 +334,96 @@ fn encode_trickroom(tr: &StateTrickRoom) -> Value {
 ///    (degenerate), fall back to uniform.
 ///
 /// Returns a `Vec<f32>` of length `options.len()`.
+/// Zero-effect mask: clear prior mass on damaging moves that can't deal any
+/// damage to the current opp active (Ghost→Normal, Levitate vs Ground, Volt
+/// Absorb vs Electric, etc.). `calculate_damage` is the single oracle — it
+/// already encodes type immunities, ability immunities, and Mold Breaker
+/// bypass.
+///
+/// Pursuit is exempt: its damage is conditional on the opp switching, so a
+/// 0 result in the current state is semantically valid for the move.
+///
+/// Operates in place. Does NOT renormalize — the caller renormalizes after.
+/// Gated by `tuning.mask_zero_effect` so we can A/B against baseline.
+pub fn apply_zero_effect_mask(
+    priors: &mut [f32],
+    state: &State,
+    perspective: SidePerspective,
+    options: &[MoveChoice],
+) {
+    if !crate::tuning::tuning().mask_zero_effect {
+        return;
+    }
+    let side = match perspective {
+        SidePerspective::Side1 => &state.side_one,
+        SidePerspective::Side2 => &state.side_two,
+    };
+    let active = side.get_active_immutable();
+    let attacking_side_ref = match perspective {
+        SidePerspective::Side1 => SideReference::SideOne,
+        SidePerspective::Side2 => SideReference::SideTwo,
+    };
+    for (i, opt) in options.iter().enumerate() {
+        let slot = match opt {
+            MoveChoice::Move(idx)
+            | MoveChoice::MoveTera(idx)
+            | MoveChoice::MoveMega(idx) => move_index_to_slot(*idx),
+            _ => continue,
+        };
+        let mv: &Move = match slot {
+            0 => &active.moves.m0,
+            1 => &active.moves.m1,
+            2 => &active.moves.m2,
+            3 => &active.moves.m3,
+            _ => continue,
+        };
+        let choice = &mv.choice;
+        if choice.category == MoveCategory::Status
+            || choice.category == MoveCategory::Switch
+        {
+            continue;
+        }
+        if choice.move_id == Choices::PURSUIT {
+            continue;
+        }
+        if let Some((max_dmg, _)) =
+            calculate_damage(state, &attacking_side_ref, choice, DamageRolls::Max)
+        {
+            if max_dmg <= 0 && i < priors.len() {
+                priors[i] = 0.0;
+            }
+        }
+    }
+}
+
+/// Build uniform priors over `options` with the zero-effect mask applied
+/// and the result renormalized. Used by PIMC / heuristic-eval paths that
+/// don't go through `map_policy_to_options` but still need the mask.
+pub fn uniform_priors_with_mask(
+    state: &State,
+    perspective: SidePerspective,
+    options: &[MoveChoice],
+) -> Vec<f32> {
+    let n = options.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut priors = vec![1.0 / n as f32; n];
+    apply_zero_effect_mask(&mut priors, state, perspective, options);
+    let sum: f32 = priors.iter().sum();
+    if sum > 1e-6 && sum.is_finite() {
+        for p in priors.iter_mut() {
+            *p /= sum;
+        }
+    } else {
+        let u = 1.0 / n as f32;
+        for p in priors.iter_mut() {
+            *p = u;
+        }
+    }
+    priors
+}
+
 pub fn map_policy_to_options(
     probs: &[f32],
     state: &State,
@@ -399,6 +491,9 @@ pub fn map_policy_to_options(
         };
         priors.push(p);
     }
+
+    // 3.5 Zero-effect mask (see apply_zero_effect_mask doc-comment).
+    apply_zero_effect_mask(&mut priors, state, perspective, options);
 
     // 4. Renormalize (or fall back to uniform).
     let sum: f32 = priors.iter().sum();

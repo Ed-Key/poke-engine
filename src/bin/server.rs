@@ -113,6 +113,12 @@ pub struct Cli {
     /// expectations may need updating when this is non-default.
     #[arg(long, env = "POKE_ENGINE_EVAL_SLOPE", default_value_t = 0.0125)]
     pub eval_slope: f32,
+
+    /// Mask 0-damage moves from the NN prior before PUCT consumes them.
+    /// Default `true` (shipped fix for Shadow-Ball-into-Lopunny class of
+    /// bugs). Use `--no-mask-zero-effect` to disable for A/B testing.
+    #[arg(long, env = "POKE_ENGINE_MASK_ZERO_EFFECT", default_value_t = true, action = clap::ArgAction::Set)]
+    pub mask_zero_effect: bool,
 }
 
 /// Shared per-process state plumbed through axum handlers.
@@ -1558,10 +1564,11 @@ async fn main() {
         dirichlet_alpha: cli.dirichlet_alpha,
         dirichlet_eps: cli.dirichlet_eps,
         eval_slope: cli.eval_slope,
+        mask_zero_effect: cli.mask_zero_effect,
     });
     log::info!(
-        "engine-prior-tuning: prior_cap={} dirichlet_alpha={} dirichlet_eps={} eval_slope={}",
-        cli.prior_cap, cli.dirichlet_alpha, cli.dirichlet_eps, cli.eval_slope,
+        "engine-prior-tuning: prior_cap={} dirichlet_alpha={} dirichlet_eps={} eval_slope={} mask_zero_effect={}",
+        cli.prior_cap, cli.dirichlet_alpha, cli.dirichlet_eps, cli.eval_slope, cli.mask_zero_effect,
     );
 
     let eval_kind = if cli.nn_eval {

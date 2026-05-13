@@ -4,7 +4,9 @@ use crate::engine::state::MoveChoice;
 use crate::eval_kind::EvalKind;
 use crate::instruction::StateInstructions;
 use crate::nn_client::Perspective;
-use crate::nn_state_encoder::{encode, map_policy_to_options, SidePerspective};
+use crate::nn_state_encoder::{
+    encode, map_policy_to_options, uniform_priors_with_mask, SidePerspective,
+};
 use crate::state::State;
 use rand::distr::weighted::WeightedIndex;
 use rand::prelude::*;
@@ -733,7 +735,21 @@ impl MctsSearch {
         // only (matching AlphaZero). When `dirichlet_eps == 0.0` (default),
         // this is a no-op and behavior is bit-identical.
         let cfg = crate::tuning::tuning();
-        let mut s1_priors = s1_priors;
+        // Zero-effect mask: when callers pass s1_priors=None (PIMC's
+        // `new_with_eval` with heuristic eval, etc.), generate masked
+        // uniform priors instead of leaving the populate fallback to fill
+        // in raw uniform mass on 0× moves. The mask is a no-op for the NN
+        // / heuristic-prior paths since their priors went through
+        // map_policy_to_options or heuristic_prior::compute which both
+        // already filter zero-effect moves.
+        let mut s1_priors = match s1_priors {
+            Some(p) => Some(p),
+            None => Some(uniform_priors_with_mask(
+                &state,
+                SidePerspective::Side1,
+                &s1_options,
+            )),
+        };
         let mut s2_priors = s2_priors;
         if cfg.dirichlet_eps > 0.0 && cfg.dirichlet_alpha > 0.0 {
             match &mut seeded_rng {
