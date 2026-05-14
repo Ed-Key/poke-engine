@@ -69,6 +69,34 @@ pub struct SideInput {
     /// engine reads via `Side.volatile_status_durations` (state.rs:995).
     #[serde(default)]
     pub volatile_status_durations: Option<VolatileStatusDurationsInput>,
+    /// Pending Future Sight (or Doom Desire) cast by this side's source
+    /// Pokemon. Engine's `Side.future_sight = (turns, pokemon_index)` —
+    /// turns counts down from 3 (just cast) to 1 (resolves this turn).
+    /// When `turns > 0`, the engine refuses to re-cast FUTURESIGHT
+    /// (choice_effects.rs:913). Without this field the parser hardcodes
+    /// (0, P0) and the engine happily recommends FS while one is
+    /// already pending — see bug-corpus `future-sight-state-missing`.
+    #[serde(default)]
+    pub future_sight: Option<FutureSightInput>,
+}
+
+/// Pending Future Sight / Doom Desire state. Extension reconstructs from
+/// Showdown's `b.stepQueue` by tracking `|-start|...|move: Future Sight`
+/// and `|-end|...|move: Future Sight` events. See
+/// `extension/lib/translate.ts::computeFutureSightState`.
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct FutureSightInput {
+    /// Turns remaining until FS resolves. 3 = just cast this turn, 2 =
+    /// next turn pending, 1 = resolves this turn. 0 / negative is
+    /// treated as no pending FS.
+    #[serde(default)]
+    pub turns: i8,
+    /// Index of the source Pokemon (the caster). Engine uses this for
+    /// damage attribution if the source has switched out by the time
+    /// FS resolves.
+    #[serde(default)]
+    pub pokemon_index: u8,
 }
 
 /// Per-volatile turn counters. Match the fields on the engine's
@@ -488,6 +516,7 @@ fn fabric_aux_side_to_input(side: &FabricAuxSide) -> SideInput {
         substitute_health: None,
         last_used_move: None,
         volatile_status_durations: None,
+        future_sight: None,
     }
 }
 
@@ -509,6 +538,7 @@ pub fn from_fabric_aux(state: &FabricAuxState) -> State {
             substitute_health: None,
             last_used_move: None,
             volatile_status_durations: None,
+            future_sight: None,
         }
     };
 
@@ -526,6 +556,7 @@ pub fn from_fabric_aux(state: &FabricAuxState) -> State {
             substitute_health: None,
             last_used_move: None,
             volatile_status_durations: None,
+            future_sight: None,
         }
     };
 
@@ -838,8 +869,13 @@ fn serialize_side(side: &SideInput) -> String {
         eva_b,                      // [17]
         0,                          // [18] wish turns
         0,                          // [19] wish hp
-        0,                          // [20] future sight turns
-        0,                          // [21] future sight pokemon_index
+        // [20-21] future sight. When the extension forwards `futureSight`,
+        // use its values; else hardcoded zero (= no FS pending). The
+        // engine refuses to re-cast FS while `turns > 0` per
+        // choice_effects.rs:913. Without this plumbing the engine never
+        // sees pending FS state and recommends FS again, which fails.
+        side.future_sight.as_ref().filter(|fs| fs.turns > 0).map(|fs| fs.turns).unwrap_or(0),
+        side.future_sight.as_ref().filter(|fs| fs.turns > 0).map(|fs| fs.pokemon_index.min(5)).unwrap_or(0),
         side.force_switch,          // [22] force_switch
         "NONE",                     // [23] switch_out_move
         false,                      // [24] baton_passing
